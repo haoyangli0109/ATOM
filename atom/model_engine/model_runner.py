@@ -157,7 +157,9 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        min_seqlen_q = 0
+        dropout_p = 0.0
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, min_seqlen_q, slot_mapping, None, block_tables, dropout_p)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -169,6 +171,8 @@ class ModelRunner:
         cu_seqlens_k = [0]
         max_seqlen_q = 1
         max_seqlen_k = 0
+        min_seqlen_q = 0
+        dropout_p = 0.0
 
         for seq in seqs:
             current_seq_len = len(seq)
@@ -190,7 +194,8 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
         set_context(False, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, min_seqlen_q=min_seqlen_q, 
+                slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, dropout_p=dropout_p)
 
         return input_ids, positions
 
@@ -244,8 +249,10 @@ class ModelRunner:
 
         cu_seqlens_q = torch.arange(max_bs + 1, dtype=torch.int32)
         cu_seqlens_k = torch.arange(max_bs + 1, dtype=torch.int32)
-        max_seqlen_q = 1
-        max_seqlen_k = 1
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        min_seqlen_q = 0
+        dropout_p = 0.0
 
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
@@ -255,13 +262,13 @@ class ModelRunner:
             graph = torch.cuda.CUDAGraph()
 
             current_max_seqlen_k = context_lens[:bs].max().item() if bs > 0 else 1
-
             set_context(False, 
                     cu_seqlens_q=cu_seqlens_q[:bs+1], 
                     cu_seqlens_k=cu_seqlens_k[:bs+1],
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=current_max_seqlen_k,
-                    slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+                    min_seqlen_q=min_seqlen_q,
+                    slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], dropout_p=dropout_p)
             # set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
 
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup

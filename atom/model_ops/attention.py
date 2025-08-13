@@ -84,13 +84,20 @@ class Attention(nn.Module):
                 cu_seqlens_k=context.cu_seqlens_k,
                 max_seqlen_q=context.max_seqlen_q,
                 max_seqlen_k=context.max_seqlen_k,
-                min_seqlen_q = 0,
-                dropout_p=0.0,
+                min_seqlen_q = context.min_seqlen_q,
+                dropout_p=context.dropout_p,
                 softmax_scale=self.scale,
                 causal=True,
             )
         else:  # decode
-            # o = torch.empty_like(q, dtype=q.dtype, device=q.device)
+            # cu_seqlens_q=torch.tensor([0, q.shape[0]],
+            #                           dtype=torch.int32,
+            #                           device=q.device),
+            # cu_seqlens_k=torch.tensor([0, k],
+            #                           dtype=torch.int32,
+            #                           device=k.device),
+            # max_seqlen_q=q.shape[1]
+            # max_seqlen_k = k.shape[1]
             o = aiter.flash_attn_varlen_func(
                 q=q,
                 k=k,
@@ -98,9 +105,9 @@ class Attention(nn.Module):
                 cu_seqlens_q=context.cu_seqlens_q,
                 cu_seqlens_k=context.cu_seqlens_k,
                 max_seqlen_q=context.max_seqlen_q,
-                max_seqlen_k=context.max_seqlen_k,
-                min_seqlen_q = 0,
-                dropout_p=0.0,
+                max_seqlen_k=0,
+                min_seqlen_q = context.min_seqlen_q,
+                dropout_p=context.dropout_p,
                 softmax_scale=self.scale,
                 causal=True,
             )
