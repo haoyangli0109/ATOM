@@ -11,7 +11,8 @@ from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from atom.model_ops.rotary_embedding import get_rope
+# from atom.model_ops.rotary_embedding import get_rope
+from aiter.rotary_embedding import get_rope
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
