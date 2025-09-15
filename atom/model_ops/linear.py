@@ -230,7 +230,7 @@ class LinearBase(nn.Module):
                     dtype=otype,
                 )
         if self.tp_dim == 1 and self.tp_size > 1:
-            y = get_tp_group().all_reduce(y, open_fp8_quant=False)
+            y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 
 

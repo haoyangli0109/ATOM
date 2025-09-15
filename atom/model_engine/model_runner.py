@@ -424,7 +424,8 @@ class ModelRunner:
                     i for i in range(16, cuda_graph_sizes[0] + 1, 16)
                 ]
             elif len(cuda_graph_sizes) > 1:
-                self.graph_bs = sorted(cuda_graph_sizes, reverse=True)
+                self.graph_bs = cuda_graph_sizes
+        self.graph_bs.sort(reverse=True)
 
         self.graphs = {}
         self.graph_pool = None

@@ -42,7 +42,7 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-            y = get_tp_group().all_reduce(y, open_fp8_quant=False)
+            y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 
 
