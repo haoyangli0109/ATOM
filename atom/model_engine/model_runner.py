@@ -313,7 +313,6 @@ class ModelRunner:
         )
         return input_ids, positions
 
-    @torch.inference_mode()
     def prepare_decode(self, scheduled_batchs: ScheduledBatchs):
         bs = len(scheduled_batchs.seqs)
         graph_bs = next(x for x in self.graph_bs if x >= bs)
@@ -386,6 +385,15 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
+    def prepare_model(self, scheduled_batchs: ScheduledBatchs):
+        seqs = scheduled_batchs.seqs
+        is_prefill = scheduled_batchs.is_prefill
+        prepare_func = self.prepare_prefill if is_prefill else self.prepare_decode
+        input_ids, positions = prepare_func(scheduled_batchs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        return input_ids, positions, temperatures
+
+    @torch.inference_mode()
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
@@ -400,12 +408,8 @@ class ModelRunner:
             return self.model.compute_logits(self.graph_vars["outputs"][:bs])
 
     def run(self, scheduled_batchs: ScheduledBatchs) -> list[int]:
-        seqs = scheduled_batchs.seqs
-        is_prefill = scheduled_batchs.is_prefill
-        prepare_func = self.prepare_prefill if is_prefill else self.prepare_decode
-        input_ids, positions = prepare_func(scheduled_batchs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        input_ids, positions, temperatures = self.prepare_model(scheduled_batchs)
+        logits = self.run_model(input_ids, positions, scheduled_batchs.is_prefill)
         token_ids = (
             self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         )
