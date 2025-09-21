@@ -1,4 +1,5 @@
 import torch
+from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
 
@@ -28,7 +29,7 @@ class Sampler(nn.Module):
     def random_sample(
         self, logits: torch.Tensor  # (token_num, vocab_size)
     ) -> torch.Tensor:  # (token_num,)
-        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+        probs = softmax(logits)
         logits = probs.div_(torch.empty_like(probs).exponential_(1) + self.eps)
         _, sampled_tokens = topk(logits, 1)
         return sampled_tokens.view(-1)
