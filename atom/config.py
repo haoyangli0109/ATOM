@@ -3,7 +3,7 @@ import torch
 import re
 from dataclasses import dataclass
 from transformers import AutoConfig
-from typing import Optional, Any, ClassVar
+from typing import Optional, Any, ClassVar, Union
 from dataclasses import field
 from aiter import QuantType
 from aiter.utility.dtypes import d_dtypes
@@ -351,6 +351,22 @@ class Config:
     torch_profiler_dir: str | None = os.getenv("ATOM_TORCH_PROFILER_DIR", None)
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(default_factory=lambda: QuantizationConfig())
+    asyncio_mode: bool = False
+    master_addr: str = "127.0.0.1"
+    graph_bs: Optional[list[int]] = None
+
+
+    def _set_cudagraph_sizes(self):
+        if self.compilation_config.cudagraph_capture_sizes:
+            self.graph_bs = self.compilation_config.cudagraph_capture_sizes
+        else:
+            cuda_graph_sizes = self.compilation_config.cuda_graph_sizes
+            if len(cuda_graph_sizes) == 1:
+                self.graph_bs = [1, 2, 4, 8] + [
+                    i for i in range(16, cuda_graph_sizes[0] + 1, 16)
+                ]
+            elif len(cuda_graph_sizes) > 1:
+                self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
         # assert os.path.isdir(self.model)
@@ -399,4 +415,3 @@ class Config:
         hash_str = hashlib.md5(str(factors).encode(),
                                usedforsecurity=False).hexdigest()[:10]
         return hash_str
-
