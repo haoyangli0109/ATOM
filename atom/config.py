@@ -376,9 +376,9 @@ class Config:
 
     def __post_init__(self):
         # assert os.path.isdir(self.model)
-        assert (self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1), (
-            f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
-        )
+        assert (
+            self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1
+        ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.quant_config = get_quant_config(self.hf_config)
@@ -386,6 +386,8 @@ class Config:
             self.max_model_len, self.hf_config.max_position_embeddings
         )
         assert self.max_num_batched_tokens >= self.max_model_len
+        if self.torch_profiler_dir is not None:
+            os.makedirs(self.torch_profiler_dir, exist_ok=True)
         assert self.torch_profiler_dir is None or os.path.isdir(
             self.torch_profiler_dir
         ), f"torch_profiler_dir {self.torch_profiler_dir} is not a valid directory"

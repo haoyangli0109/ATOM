@@ -42,10 +42,8 @@ docker run -it --network=host \
 ### 3. Clone and Setup
 
 ```bash
+pip install aiter -i https://mkmartifactory.amd.com/artifactory/api/pypi/hw-orc3pypi-prod-local/simple
 git clone https://github.com/valarLip/atom.git
-git clone --recursive https://github.com/ROCm/aiter.git
-cd aiter
-python3 setup.py develop
 cd ../atom
 pip install .
 ```
@@ -57,7 +55,7 @@ pip install .
 The default optimization level is 3 (running with torch compile). Supported models include **Qwen**, **Llama**, and **Mixtral**.
 
 ```bash
-python -m atom.bench.example.py --model meta-llama/Meta-Llama-3-8B
+python -m atom.bench.example --model meta-llama/Meta-Llama-3-8B
 ```
 
 > **Note:** First-time execution may take approximately 10 minutes for model compilation.
@@ -67,7 +65,7 @@ python -m atom.bench.example.py --model meta-llama/Meta-Llama-3-8B
 Run performance tests to compare ATOM against vLLM:
 
 ```bash
-python -m atom.bench.one_batch.py --model Qwen/Qwen3-0.6B
+python -m atom.bench.one_batch --model Qwen/Qwen3-0.6B
 ```
 
 ## 📊 Performance Comparison
