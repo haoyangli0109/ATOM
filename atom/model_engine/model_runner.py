@@ -452,10 +452,8 @@ class ModelRunner:
         # Upload the index tensors asynchronously
         # so the scatter can be non-blocking.
 
-        self.input_ids_index_tensor.cpu[:num_commmon_tokens] = torch.tensor(
-            flattened_indices, dtype=torch.int64, device="cpu")
-        self.prev_common_req_indices_tensor.cpu[:num_commmon_tokens] = torch.tensor(
-            prev_common_req_indices, dtype=torch.int64, device="cpu")
+        self.input_ids_index_tensor.np[:num_commmon_tokens] = np.array(flattened_indices, dtype=np.int64)
+        self.prev_common_req_indices_tensor.np[:num_commmon_tokens] = np.array(prev_common_req_indices, dtype=np.int64)
         
         self.input_ids_index_tensor.copy_to_gpu(num_commmon_tokens)
         self.prev_common_req_indices_tensor.copy_to_gpu(num_commmon_tokens)
