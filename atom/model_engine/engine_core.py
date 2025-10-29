@@ -146,11 +146,12 @@ class EngineCore:
     def pull_and_process_input_queue(self):
         recv_reqs = []
         while not self.input_queue.empty():
-            seq = self.input_queue.get_nowait()
-            if seq.status == SequenceStatus.EXIT_ENGINE:
-                logger.debug(f"{self.label}: input_queue get {seq.status}")
-                return True
-            recv_reqs.append(seq)
+            seqs = self.input_queue.get_nowait()
+            for seq in seqs:
+                if seq.status == SequenceStatus.EXIT_ENGINE:
+                    logger.debug(f"{self.label}: input_queue get exit engine")
+                    return True
+                recv_reqs.append(seq)
         if len(recv_reqs) > 0:
             logger.info(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
@@ -175,13 +176,14 @@ class EngineCore:
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
                     serialized_obj = input_socket.recv(copy=False)
-                    request_type, req = pickle.loads(serialized_obj)
+                    request_type, reqs = pickle.loads(serialized_obj)
                     if request_type == EngineCoreRequestType.ADD:
-                        logger.debug(f"{self.label}: input get {request_type} {req.id}")
-                        self.input_queue.put_nowait(req)
+                        req_ids = [req.id for req in reqs]
+                        logger.debug(f"{self.label}: input get {request_type} {req_ids}")
+                        self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
-                        self.input_queue.put_nowait(get_exit_sequence())
+                        self.input_queue.put_nowait([get_exit_sequence()])
                         alive = False
                         reason = request_type
             logger.debug(f"{self.label}: input thread exit due to {reason}")

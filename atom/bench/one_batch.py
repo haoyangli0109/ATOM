@@ -4,17 +4,16 @@ from random import randint, seed
 
 from transformers import AutoTokenizer
 
-from atom import LLMEngine, SamplingParams
-from atom.config import CompilationConfig
+from atom import SamplingParams
+from atom.model_engine.arg_utils import EngineArgs
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config of test",
 )
 
-parser.add_argument(
-    "--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path."
-)
+# Add engine arguments
+EngineArgs.add_cli_args(parser)
 
 # A very long prompt, total number of tokens is about 15k.
 LONG_PROMPT = [
@@ -32,19 +31,10 @@ def main():
     max_ouput_len = 1024
 
     args = parser.parse_args()
-    path = args.model
-    llm = LLMEngine(
-        path,
-        enforce_eager=False,
-        tensor_parallel_size=1,
-        kv_cache_block_size=16,
-        max_model_len=4096,
-        port=12345,
-        torch_profiler_dir="./log",
-        compilation_config=CompilationConfig(
-            level=3,
-        ),
-    )
+    
+    # Create engine from args
+    engine_args = EngineArgs.from_cli_args(args)
+    llm = engine_args.create_engine()
 
     sampling_params = [
         SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=16)

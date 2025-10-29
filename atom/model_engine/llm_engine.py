@@ -1,8 +1,9 @@
+import asyncio
 import itertools
 import logging
 import time
 from dataclasses import fields
-from typing import List
+from typing import List, Union
 
 import torch.multiprocessing as mp
 from tqdm.auto import tqdm
@@ -31,16 +32,32 @@ class LLMEngine:
             self.tokenizer, config.kv_cache_block_size
         )
         self.core_mgr = CoreManager(config)
+        self._step_lock = None
+        self._pending_results = {}
         logger.info("LLMEngine init")
 
     def add_request(
-        self, prompt_or_tokens: str | list[int], sampling_params: SamplingParams
+        self, 
+        prompt_or_tokens_list: List[Union[str, List[int]]], 
+        sampling_params_list: SamplingParams | List[SamplingParams]
     ):
-        # 1. convet prompt to request
-        req = self.io_processor.preprocess(prompt_or_tokens, sampling_params)
-
-        # 2. add req to scheduler
-        self.core_mgr.add_request(req)
+        # if sampling params is not list, use it for all prompts
+        if not isinstance(sampling_params_list, list):
+            sampling_params_iter = itertools.repeat(sampling_params_list)
+        else:
+            # otherwise check num elements first
+            if len(prompt_or_tokens_list) != len(sampling_params_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and sampling_params_list is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(sampling_params_list)=}"
+                )
+            sampling_params_iter = sampling_params_list
+        
+        reqs = []
+        for prompt, sampling_param in zip(prompt_or_tokens_list, sampling_params_iter):
+            req = self.io_processor.preprocess(prompt, sampling_param)
+            reqs.append(req)
+        self.core_mgr.add_request(reqs)
 
     def step(self) -> list[Sequence]:
         seqs = self.core_mgr.get_output()
@@ -55,14 +72,7 @@ class LLMEngine:
         prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
     ) -> list[str]:
-        if isinstance(sampling_params, list):
-            iter_func = zip
-        else:
-            iter_func = itertools.product
-            sampling_params = [sampling_params]
-        for prompt, sp in iter_func(prompts, sampling_params):
-            self.add_request(prompt, sp)
-
+        self.add_request(prompts, sampling_params)
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -73,6 +83,49 @@ class LLMEngine:
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         return outputs
+
+    async def generate_async(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+    ):
+        # Initialize lock on first use
+        if self._step_lock is None:
+            self._step_lock = asyncio.Lock()
+        
+        # Add the request and get its sequence ID
+        req = self.io_processor.preprocess(prompt, sampling_params)
+        seq_id = req.id
+        self.core_mgr.add_request([req])
+        
+        while True:
+            # Check if result is already available
+            if seq_id in self._pending_results:
+                result = self._pending_results.pop(seq_id)
+                yield result
+                return
+            
+            if seq_id not in self.io_processor.requests:
+                break
+            
+            if not (self.core_mgr.is_alive() or self.core_mgr.is_rest()):
+                break
+            
+            # Coordinate step() calls across all concurrent requests
+            async with self._step_lock:
+                seqs = self.step()
+                outs = self.io_processor.postprocess(seqs)
+                
+                # Store all results so other waiting tasks can find them
+                self._pending_results.update(outs)
+            
+            if seq_id in self._pending_results:
+                result = self._pending_results.pop(seq_id)
+                yield result
+                return
+            
+            # Let other tasks run before trying again
+            await asyncio.sleep(0)
 
 
 class InputOutputProcessor:

@@ -102,10 +102,10 @@ class CoreManager:
                 shutdown_sender.send(b"")
         self.output_queue_thread.join()
 
-    def add_request(self, seq: Sequence):
-        logger.debug(f"{self.label}: Add request, sequence id: {seq.id}")
+    def add_request(self, seqs: List[Sequence]):
+        logger.debug(f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}")
         self.input_socket.send_multipart(
-            [self.engine_core_identity, pickle.dumps((EngineCoreRequestType.ADD, seq))],
+            [self.engine_core_identity, pickle.dumps((EngineCoreRequestType.ADD, seqs))],
             copy=False,
         )
 

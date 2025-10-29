@@ -1,274 +1,249 @@
 import argparse
 import asyncio
-import json
 import time
+from typing import List, Optional, Dict, Any, Union
 import uuid
-from datetime import datetime
-from typing import List, Optional, Dict, Any
 
-import torch
-import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
+import uvicorn
 from transformers import AutoTokenizer
 
-from atom import LLMEngine, SamplingParams
-from atom.config import CompilationConfig
+from atom import SamplingParams
+from atom.model_engine.arg_utils import EngineArgs
 
 
-# Request models
-class CompletionRequest(BaseModel):
-    model: str = "atom"
-    prompt: str | List[str]
-    max_tokens: Optional[int] = 256
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
-    stream: Optional[bool] = False
-    stop: Optional[str | List[str]] = None
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
-
-
+# OpenAI API Models
 class ChatMessage(BaseModel):
     role: str
     content: str
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "atom"
+    model: str
     messages: List[ChatMessage]
-    max_tokens: Optional[int] = 256
-    temperature: Optional[float] = 0.7
+    temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
-    stream: Optional[bool] = False
-    stop: Optional[str | List[str]] = None
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
+    max_tokens: Optional[int] = 256
+    stop: Optional[List[str]] = None
+    ignore_eos: Optional[bool] = False
 
 
-# Global engine and tokenizer
-llm_engine: Optional[LLMEngine] = None
-tokenizer: Optional[Any] = None
-# Lock to serialize generation calls
-generation_lock: Optional[asyncio.Lock] = None
-# Log file path
-log_file_path: Optional[str] = None
+class CompletionRequest(BaseModel):
+    model: str
+    prompt: Union[str, List[str]]  # Support both single string and list of strings
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
+    max_tokens: Optional[int] = 256
+    stop: Optional[List[str]] = None
+    ignore_eos: Optional[bool] = False
 
 
-def parse_size_list(size_str: str) -> List[int]:
-    import ast
-    try:
-        return ast.literal_eval(size_str)
-    except (ValueError, SyntaxError) as e:
-        raise ValueError(f"Error list size: {size_str}") from e
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[Dict[str, Any]]
+    usage: Dict[str, int]
 
 
-def log_request_response(request_id: str, prompts: List[str], outputs: List[Dict], endpoint: str):
-    """Log request inputs and outputs to JSONL file"""
-    if log_file_path is None:
-        return
+class CompletionResponse(BaseModel):
+    id: str
+    object: str = "text_completion"
+    created: int
+    model: str
+    choices: List[Dict[str, Any]]
+    usage: Dict[str, int]
+
+
+# Global engine
+engine = None
+tokenizer: Optional[AutoTokenizer] = None
+model_name: str = ""
+
+
+async def generate_async(prompt: str, sampling_params: SamplingParams) -> Dict[str, Any]:
+    """Async wrapper for engine generation."""
+    global engine
     
-    log_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "request_id": request_id,
-        "endpoint": endpoint,
-        "prompts": prompts,
-        "outputs": [{"text": out["text"]} for out in outputs]
-    }
-    
-    try:
-        with open(log_file_path, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception as e:
-        print(f"Error writing to log file: {e}")
+    # Use the new async generate method that handles each request independently
+    async for output in engine.generate_async(prompt, sampling_params):
+        return output
 
 
-def init_engine(args):
-    global llm_engine, tokenizer, generation_lock, log_file_path
-    
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    # LLMEngine needs a separate port for distributed communication
-    engine_port = args.port + 1000  # e.g., if API port is 8000, engine uses 9000
-    llm_engine = LLMEngine(
-        args.model,
-        enforce_eager=args.enforce_eager,
-        tensor_parallel_size=args.tensor_parallel_size,
-        kv_cache_dtype=args.kv_cache_dtype,
-        port=engine_port,
-        torch_profiler_dir=args.torch_profiler_dir,
-        compilation_config=CompilationConfig(
-            level=args.level,
-            cudagraph_capture_sizes=parse_size_list(args.cudagraph_capture_sizes)
-        )
-    )
-    generation_lock = asyncio.Lock()
-    
-    # Set log file path if enabled
-    if args.log_requests:
-        log_file_path = args.log_file
-        print(f"Request/Response logging enabled: {log_file_path}")
+app = FastAPI(title="Atom OpenAI API Server")
 
 
-app = FastAPI(title="Atom OpenAI-Compatible API")
-
-
-@app.post("/v1/completions")
-async def create_completion(request: CompletionRequest):
-    if llm_engine is None or generation_lock is None:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-    prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
-    
-    sampling_params = SamplingParams(
-        temperature=request.temperature,
-        max_tokens=request.max_tokens,
-        stop_strings=request.stop,
-    )
-    
-    # Use lock to serialize generation calls and run in thread pool to avoid blocking
-    async with generation_lock:
-        loop = asyncio.get_event_loop()
-        outputs = await loop.run_in_executor(
-            None, 
-            llm_engine.generate, 
-            prompts, 
-            sampling_params
-        )
-    
-    # Log request and response
-    log_request_response(request_id, prompts, outputs, "/v1/completions")
-    
-    choices = []
-    for i, output in enumerate(outputs):
-        choices.append({
-            "text": output["text"],
-            "index": i,
-            "logprobs": None,
-            "finish_reason": "stop"
-        })
-    
-    return JSONResponse({
-        "id": request_id,
-        "object": "text_completion",
-        "created": int(time.time()),
-        "model": request.model,
-        "choices": choices,
-        "usage": {
-            "prompt_tokens": sum(len(tokenizer.encode(p)) for p in prompts),
-            "completion_tokens": sum(len(tokenizer.encode(c["text"])) for c in choices),
-            "total_tokens": sum(len(tokenizer.encode(p)) for p in prompts) + sum(len(tokenizer.encode(c["text"])) for c in choices)
-        }
-    })
-
-
-@app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest):
-    if llm_engine is None or tokenizer is None or generation_lock is None:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-    
-    # Convert chat messages to prompt
-    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def chat_completions(request: ChatCompletionRequest):
+    """Handle chat completion requests."""
+    global engine, tokenizer, model_name
     
     try:
+        # Convert messages to prompt using chat template
         prompt = tokenizer.apply_chat_template(
-            messages,
+            [{"role": msg.role, "content": msg.content} for msg in request.messages],
             tokenize=False,
             add_generation_prompt=True,
         )
-    except Exception as e:
-        # Fallback: simple concatenation
-        prompt = "\n".join([f"{msg.role}: {msg.content}" for msg in request.messages])
-    
-    sampling_params = SamplingParams(
-        temperature=request.temperature,
-        max_tokens=request.max_tokens,
-        stop_strings=request.stop,
-    )
-    
-    # Use lock to serialize generation calls and run in thread pool to avoid blocking
-    async with generation_lock:
-        loop = asyncio.get_event_loop()
-        outputs = await loop.run_in_executor(
-            None,
-            llm_engine.generate,
-            [prompt],
-            sampling_params
+        
+        # Create sampling params
+        sampling_params = SamplingParams(
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            stop_strings=request.stop,
+            ignore_eos=request.ignore_eos,
         )
-    
-    # Log request and response
-    log_request_response(request_id, [prompt], outputs, "/v1/chat/completions")
-    
-    completion_text = outputs[0]["text"] if outputs else ""
-    
-    return JSONResponse({
-        "id": request_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": request.model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": completion_text,
+        
+        # Generate response
+        output = await generate_async(prompt, sampling_params)
+        
+        # Format response
+        response = ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": output["text"],
+                    },
+                    "finish_reason": output["finish_reason"],
+                }
+            ],
+            usage={
+                "prompt_tokens": output["num_tokens_input"],
+                "completion_tokens": output["num_tokens_output"],
+                "total_tokens": output["num_tokens_input"] + output["num_tokens_output"],
             },
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": len(tokenizer.encode(prompt)),
-            "completion_tokens": len(tokenizer.encode(completion_text)),
-            "total_tokens": len(tokenizer.encode(prompt)) + len(tokenizer.encode(completion_text))
-        }
-    })
+        )
+        
+        return response
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/completions", response_model=CompletionResponse)
+async def completions(request: CompletionRequest):
+    """Handle text completion requests."""
+    global engine, model_name
+    
+    try:
+        # Create sampling params
+        sampling_params = SamplingParams(
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            stop_strings=request.stop,
+            ignore_eos=request.ignore_eos,
+        )
+        
+        # Handle both single prompt and batch prompts
+        if isinstance(request.prompt, str):
+            # Single prompt
+            output = await generate_async(request.prompt, sampling_params)
+            choices = [
+                {
+                    "index": 0,
+                    "text": output["text"],
+                    "finish_reason": output["finish_reason"],
+                }
+            ]
+            total_prompt_tokens = output["num_tokens_input"]
+            total_completion_tokens = output["num_tokens_output"]
+        else:
+            # Batch prompts - process concurrently
+            tasks = [
+                generate_async(prompt, sampling_params)
+                for prompt in request.prompt
+            ]
+            outputs = await asyncio.gather(*tasks)
+            
+            choices = [
+                {
+                    "index": i,
+                    "text": output["text"],
+                    "finish_reason": output["finish_reason"],
+                }
+                for i, output in enumerate(outputs)
+            ]
+            total_prompt_tokens = sum(output["num_tokens_input"] for output in outputs)
+            total_completion_tokens = sum(output["num_tokens_output"] for output in outputs)
+        
+        # Format response
+        response = CompletionResponse(
+            id=f"cmpl-{uuid.uuid4().hex}",
+            created=int(time.time()),
+            model=request.model,
+            choices=choices,
+            usage={
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+        )
+        
+        return response
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/v1/models")
 async def list_models():
-    return JSONResponse({
+    """List available models."""
+    global model_name
+    return {
         "object": "list",
-        "data": [{
-            "id": "atom",
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "atom"
-        }]
-    })
+        "data": [
+            {
+                "id": model_name,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "atom",
+            }
+        ],
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "engine_ready": llm_engine is not None}
+    """Health check endpoint."""
+    return {"status": "ok"}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Atom OpenAI-Compatible Serving")
+    global engine, tokenizer, model_name
     
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path")
+    parser = argparse.ArgumentParser(description="Atom OpenAI API Server")
+    
+    # Add engine arguments
+    EngineArgs.add_cli_args(parser)
+    
+    # Add server-specific arguments
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--port", type=int, default=8000, help="API server port (engine will use port+1000)")
-    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
-    parser.add_argument("--kv_cache_dtype", choices=["bf16", "fp8"], type=str, default="bf16")
-    parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode")
-    parser.add_argument("--enable_prefix_caching", action="store_true", help="Enable prefix caching")
-    parser.add_argument("--cudagraph-capture-sizes", type=str, default="[1,2,4,8,16]")
-    parser.add_argument("--level", type=int, default=3, help="Compilation level")
-    parser.add_argument("--torch-profiler-dir", type=str, default=None)
-    parser.add_argument("--log-requests", action="store_true", help="Enable request/response logging")
-    parser.add_argument("--log-file", type=str, default="serving_requests.jsonl", help="Path to log file for requests/responses")
+    parser.add_argument(
+        "--server-port", type=int, default=8000, 
+        help="Server port (note: --port is used for internal engine communication)"
+    )
     
     args = parser.parse_args()
     
-    print(f"Initializing engine with model: {args.model}")
-    init_engine(args)
-    print("Engine initialized successfully")
+    # Initialize tokenizer
+    print(f"Loading tokenizer from {args.model}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model_name = args.model
     
-    print(f"Starting server at http://{args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # Initialize engine
+    print(f"Initializing engine with model {args.model}...")
+    engine_args = EngineArgs.from_cli_args(args)
+    engine = engine_args.create_engine()
+    
+    print(f"Starting server on {args.host}:{args.server_port}...")
+    uvicorn.run(app, host=args.host, port=args.server_port)
 
 
 if __name__ == "__main__":
