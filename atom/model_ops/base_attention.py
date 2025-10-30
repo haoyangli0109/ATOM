@@ -10,12 +10,7 @@ from torch import nn
 
 from atom.utils.context import get_context
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils.forward_context import (
-    AttentionMetadata,
-    ForwardContext,
-    get_forward_context,
-    set_forward_context,
-)
+
 from atom.utils import mark_spliting_op
 from .attention_mla import MLAModules
 from atom.config import get_current_atom_config

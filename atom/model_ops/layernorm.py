@@ -1,6 +1,23 @@
+from typing import List, Tuple, Optional, Union
 import torch
 from torch import nn
 from aiter import rmsnorm2d_fwd, rmsnorm2d_fwd_with_add, rms_norm
+from aiter.jit.utils.torch_guard import torch_compile_guard
+
+@torch_compile_guard()
+def rmsnorm2d_fwd_(x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
+    ori_shape = x.shape
+    x = x.reshape(-1, dim)
+    return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
+
+@torch_compile_guard()
+def rmsnorm2d_fwd_with_add_(x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    ori_shape = x.shape
+    x = x.reshape(-1, dim)
+    out = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+    rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
+    return out.view(ori_shape), residual_out.view(ori_shape)
 
 
 class RMSNorm(nn.Module):
@@ -44,15 +61,9 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        ori_shape = x.shape
-        x = x.reshape(-1, self.dim)
         if residual is None:
-            return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
+            # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
+            return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
         else:
             # return self.add_rms_forward(x, residual)
-            residual_out = torch.empty_like(x)
-            out = torch.empty_like(x)
-            rmsnorm2d_fwd_with_add(
-                out, x, residual, residual_out, self.weight, self.eps
-            )
-            return out.view(ori_shape), residual_out.view(ori_shape)
+            return rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
