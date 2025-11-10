@@ -87,8 +87,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
-    def __init__(self, block_size: int):
+    def __init__(self, block_size: int, device: torch.device):
         self.block_size = block_size
+        self.device = device
 
     def prepare_prefill(self, batch: ScheduledBatch, forward_vars):
         bs = batch.total_seqs_num_prefill

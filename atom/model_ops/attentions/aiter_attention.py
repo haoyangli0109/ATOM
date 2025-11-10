@@ -26,8 +26,8 @@ class AiterBackend(AttentionBackend):
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
 
-    def __init__(self, block_size: int):
-        super().__init__(block_size)  # Call parent __init__ to initialize _cached_kv_cache_data
+    def __init__(self, block_size: int, device: torch.device):
+        super().__init__(block_size, device)  # Call parent __init__ to initialize _cached_kv_cache_data
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int, forward_vars):
         scheduled_bs = batch.total_seqs_num_decode

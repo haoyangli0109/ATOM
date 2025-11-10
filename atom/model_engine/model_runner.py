@@ -207,16 +207,10 @@ class ModelRunner:
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
+        self.device = torch.device(f"cuda:{rank}")
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
         self.use_mla = self.is_deepseek_mla()
-        self.attn_backend = get_attn_backend(
-            self.block_size,
-            use_mla=self.use_mla,
-        )
-        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
-            self.block_size
-        )
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -231,9 +225,7 @@ class ModelRunner:
 
         self.graph_bs = [0]  # for eager fallback
 
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
-        self.device = device
+        torch.cuda.set_device(self.device)
         os.environ["MASTER_ADDR"] = self.config.master_addr
         os.environ["MASTER_PORT"] = str(self.config.port)
         init_dist_env(self.world_size, rankID=rank)
@@ -241,6 +233,14 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        self.attn_backend = get_attn_backend(
+            self.block_size,
+            use_mla=self.use_mla,
+        )
+        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
+            self.block_size,
+            self.device,
+        )
         self.tokenID_processor = tokenIDProcessor(
             self.config.max_num_batched_tokens, self.device
         )

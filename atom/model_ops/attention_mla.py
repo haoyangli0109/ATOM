@@ -14,7 +14,11 @@ from torch import nn
 from tqdm import tqdm
 
 from atom.model_ops.utils import get_and_maybe_dequant_weights
-from atom.utils.forward_context import AttentionMetaData, ForwardContext, get_forward_context
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    ForwardContext,
+    get_forward_context,
+)
 
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
@@ -83,7 +87,8 @@ class MLAAttention(nn.Module):
         self.o_proj = mla_modules.o_proj
         self.kv_b_proj = mla_modules.kv_b_proj
         self.kv_cache = torch.tensor([])
-        self._k_scale = torch.tensor(1.0, dtype=torch.float32)
+        self.one_scale = torch.tensor(1.0, dtype=torch.float32)
+        self._k_scale = self.one_scale
         self.topk_indices_buffer = (
             mla_modules.indexer.topk_indices_buffer
             if mla_modules.indexer is not None
@@ -158,32 +163,6 @@ class MLAAttention(nn.Module):
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
-
-    def _aiter_mla_decode_fwd(
-        self,
-        q: torch.Tensor,
-        kv_buffer: torch.Tensor,
-        o: torch.Tensor,
-        qo_indptr: torch.Tensor,
-        max_seqlen_qo: int,
-        kv_indptr: Optional[torch.Tensor] = None,
-        kv_indices: Optional[torch.Tensor] = None,
-        kv_last_page_lens: Optional[torch.Tensor] = None,
-        sm_scale: float = 1.0,
-        logit_cap: float = 0.0,
-    ) -> None:
-        mla_decode_fwd(
-            q,
-            kv_buffer.view(-1, 1, 1, q.shape[-1]),
-            o,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_qo,
-            sm_scale=sm_scale,
-            logit_cap=logit_cap,
-        )
 
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -277,16 +256,31 @@ class MLAAttention(nn.Module):
                 self.topk_indices_buffer[:B],
             )
 
-        self._aiter_mla_decode_fwd(
+        q_scale = kv_scale = None
+        if self.kv_cache_dtype.startswith("fp8"):
+            q = q.to(dtypes.fp8)
+            q_scale = kv_scale = self.one_scale
+        mla_decode_fwd(
             q,
-            kv_buffer,
+            kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
             attn_metadata.cu_seqlens_q,
-            attn_metadata.max_q_len,
             paged_kv_indptr,
             paged_kv_indices,
             attn_metadata.kv_last_page_lens,
+            attn_metadata.max_q_len,
             self.scale,
+            0.0,
+            None,
+            None,
+            attn_metadata.work_meta_data,
+            attn_metadata.work_indptr,
+            attn_metadata.work_info_set,
+            attn_metadata.reduce_indptr,
+            attn_metadata.reduce_final_map,
+            attn_metadata.reduce_partial_map,
+            q_scale,
+            kv_scale,
         )
 
         return self._v_up_proj_and_o_proj(o)

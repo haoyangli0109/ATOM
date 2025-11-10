@@ -50,6 +50,13 @@ class AttentionMetaData:
     cu_seqlen_ke: Optional[torch.Tensor] = None
     sparse_kv_indptr: Optional[torch.Tensor] = None
 
+    work_meta_data: Optional[torch.Tensor] = None
+    work_indptr: Optional[torch.Tensor] = None
+    work_info_set: Optional[torch.Tensor] = None
+    reduce_indptr: Optional[torch.Tensor] = None
+    reduce_final_map: Optional[torch.Tensor] = None
+    reduce_partial_map: Optional[torch.Tensor] = None
+
     def __init__(
         self,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -68,6 +75,12 @@ class AttentionMetaData:
         cu_seqlen_ks: Optional[torch.Tensor] = None,
         cu_seqlen_ke: Optional[torch.Tensor] = None,
         sparse_kv_indptr: Optional[torch.Tensor] = None,
+        work_meta_data: Optional[torch.Tensor] = None,
+        work_indptr: Optional[torch.Tensor] = None,
+        work_info_set: Optional[torch.Tensor] = None,
+        reduce_indptr: Optional[torch.Tensor] = None,
+        reduce_final_map: Optional[torch.Tensor] = None,
+        reduce_partial_map: Optional[torch.Tensor] = None,
     ):
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_k = cu_seqlens_k
@@ -85,6 +98,12 @@ class AttentionMetaData:
         self.cu_seqlen_ks = cu_seqlen_ks
         self.cu_seqlen_ke = cu_seqlen_ke
         self.sparse_kv_indptr = sparse_kv_indptr
+        self.work_meta_data = work_meta_data
+        self.work_indptr = work_indptr
+        self.work_info_set = work_info_set
+        self.reduce_indptr = reduce_indptr
+        self.reduce_final_map = reduce_final_map
+        self.reduce_partial_map = reduce_partial_map
 
     def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""

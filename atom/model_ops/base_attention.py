@@ -51,7 +51,7 @@ class Attention(nn.Module):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: MLAModules=None,
+        mla_modules: MLAModules = None,
         **kwargs,
     ):
         super().__init__()
