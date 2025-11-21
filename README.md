@@ -1,6 +1,6 @@
 # ATOM
 
-**ATOM** (AI Tensor Offline Model) is a lightweight vLLM-like implementation, focusing on integration and optimization based on [aiter](https://github.com/ROCm/aiter).
+**ATOM** (AiTer Optimized Model) is a lightweight vLLM-like implementation, focusing on integration and optimization based on [aiter](https://github.com/ROCm/aiter).
 
 ## 🚀 Features
 
