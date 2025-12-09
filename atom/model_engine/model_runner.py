@@ -20,6 +20,7 @@ from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.llama import LlamaForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
 from atom.models.qwen3 import Qwen3ForCausalLM
+from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -46,6 +47,7 @@ from atom.utils.forward_context import (
 
 suppot_model_arch_dict = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
+    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "LlamaForCausalLM": LlamaForCausalLM,
     "MixtralForCausalLM": MixtralForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
@@ -527,7 +529,12 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         torch.set_default_device("cpu")
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            assert hf_config.num_key_value_heads % self.world_size == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            assert self.world_size % hf_config.num_key_value_heads == 0
+            num_kv_heads = 1
         if self.use_mla:
             block_bytes = (
                 hf_config.num_hidden_layers
@@ -564,7 +571,12 @@ class ModelRunner:
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            assert hf_config.num_key_value_heads % self.world_size == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            assert self.world_size % hf_config.num_key_value_heads == 0
+            num_kv_heads = 1       
         if self.use_mla:
             self.kv_cache = torch.zeros(
                 hf_config.num_hidden_layers,
