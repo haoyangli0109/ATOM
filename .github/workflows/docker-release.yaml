@@ -1,0 +1,82 @@
+name: Nightly Docker Release
+
+on:
+  schedule:
+    - cron: '0 1 * * *'  # Every day at 09:00 Beijing Time (UTC+8)
+  workflow_dispatch:
+
+jobs:
+  docker-release:
+    name: Nightly Docker Release
+    runs-on: atom-mi355-1gpu
+
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build --network=host -t atom_release:ci -f docker/Dockerfile .
+          docker inspect atom_release:ci
+
+      - name: Test Docker image
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom_release_ci | xargs -r docker stop | xargs -r docker rm
+              
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+              
+          echo "Starting container: atom_release_ci (image: atom_release:ci)"
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            --ipc=host --group-add video \
+            --shm-size 16g \
+            --cap-add=SYS_PTRACE \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            --name atom_release_ci \
+            atom_release:ci
+              
+          docker exec atom_release_ci bash -c \
+            "python3 -m atom.examples.simple_inference \
+               --model meta-llama/Meta-Llama-3-8B-Instruct \
+               --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_release_output.txt
+          
+          echo ""
+          echo "========== Showing release output below =========="
+          cat atom_release_output.txt
+
+          echo ""
+          echo "========== Comparing output with golden outputs =========="
+          # Ignore whitespace and EOL differences in the diff
+          diff -u -B -w --strip-trailing-cr atom_release_output.txt .github/workflows/golden_outputs.txt || true
+          DIFF_EXIT_CODE=$?
+          
+          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+            echo "Output does not match golden outputs."
+            exit 1
+          else
+            echo "Output matches golden outputs."
+          fi
+
+      - name: Push Docker image
+        run: |
+          # Push both the versioned tag and update the 'latest' tag for the Docker image
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          TAG=nightly-$(date +%Y%m%d%H%M)
+          docker tag atom_release:ci rocm/atom:${TAG}
+          docker tag atom_release:ci rocm/atom:latest
+          docker push rocm/atom:${TAG}
+          docker push rocm/atom:latest
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker stop atom_release || true
+          docker rm atom_release || true
