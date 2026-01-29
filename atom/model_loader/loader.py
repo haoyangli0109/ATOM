@@ -15,6 +15,7 @@ from tqdm import tqdm
 from transformers import AutoConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
+from atom.config import QuantizationConfig
 from atom.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -31,6 +32,8 @@ from atom.models.deepseek_mtp import (
 )
 
 logger = logging.getLogger("atom")
+from aiter import QuantType
+from aiter.dist.parallel_state import get_tp_group
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -86,16 +89,22 @@ def load_model(
     hf_config: AutoConfig,
     load_dummy: bool = False,
     spec_decode: bool = False,
+    quant_config: QuantizationConfig | None = None,
 ):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
+    unsqueeze_weight_scale_for_quark_ptpc = False
+    if quant_config is not None and quant_config["quant_method"] == "quark" and quant_config["quant_type"] == QuantType.per_Token:
+        unsqueeze_weight_scale_for_quark_ptpc = True
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false").lower() == "true"
         for name, weight_tensor in safetensors_weights_iterator(
             model_name_or_path, disable_mmap=disable_mmap
         ):
+            if unsqueeze_weight_scale_for_quark_ptpc and "weight_scale" in name:
+                weight_tensor = weight_tensor.unsqueeze(-1)
             if load_dummy:
                 continue
             if name.endswith("kv_scale"):

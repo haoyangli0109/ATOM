@@ -600,7 +600,7 @@ class ModelRunner:
         model_class = resolve_obj_by_qualname(support_model_arch_dict[hf_config.architectures[0]])  # type: ignore
         self.model = model_class(config)
         torch.set_default_device(None)
-        load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        load_model(self.model, config.model, config.hf_config, config.load_dummy, False, config.quant_config)
         logger.info(f"Model load done: {config.model}")
 
         if hasattr(self, "drafter"):
