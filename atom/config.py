@@ -255,6 +255,7 @@ class QuantizationConfig(dict):
         is_dynamic=True,
         quant_name="",
         quant_method=None,
+        exclude_layers: Optional[list[str]] = None,
     ):
         super().__init__()
         self["quant_type"] = quant_type if quant_type is not None else QuantType.No
@@ -262,6 +263,7 @@ class QuantizationConfig(dict):
         self["quant_name"] = quant_name
         self["is_dynamic"] = is_dynamic
         self["quant_method"] = quant_method
+        self["exclude_layers"] = exclude_layers if exclude_layers is not None else []
 
     def get_name(self):
         return self["quant_name"]
@@ -348,8 +350,23 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
         is_dynamic = False
     else:
         is_dynamic = True
+    if quant_method == "compressed-tensors":
+        exclude_layers_key = "ignore"
+    elif quant_method == "quark":
+        exclude_layers_key = "exclude"
+    else:
+        logger.warning(
+            f"Using 'ignore' as key for exclude layers with quant_method {quant_method}, \
+                       please double check the quantization config."
+        )
+        exclude_layers_key = "ignore"
+    exclude_layers = orig_quant_config.get(exclude_layers_key, None)
     return QuantizationConfig(
-        quant_type, quant_dtype, is_dynamic, quant_method=quant_method
+        quant_type,
+        quant_dtype,
+        is_dynamic,
+        quant_method=quant_method,
+        exclude_layers=exclude_layers,
     )
 
 
@@ -535,6 +552,7 @@ class SpeculativeConfig:
 @dataclass
 class Config:
     model: str
+    trust_remote_code: bool = False
     max_num_batched_tokens: int = 16384
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
