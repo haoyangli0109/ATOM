@@ -302,7 +302,12 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
     quant_method = orig_quant_config.get("quant_method", None)
     RE_QUANT_BLOCKSIZE = r"\'(?:group_size|weight_block_size)\'\:\s*(?:\[\n*)\s*(\d+),"
     orig_quant_config_str = str(orig_quant_config)
-    if quant_method == "compressed-tensors" or "channel'," in orig_quant_config_str:
+    if quant_method == "quark":
+        # It’s best to implement this using a static method, but for future extensibility, I’ll instantiate the class for now.
+        from atom.quantization.quark.quark import QuarkConfig
+        quark_config = QuarkConfig(orig_quant_config)
+        return quark_config.quant_config
+    elif quant_method == "compressed-tensors" or "channel'," in orig_quant_config_str:
         quant_type = QuantType.per_Token
     elif group_size := re.search(RE_QUANT_BLOCKSIZE, orig_quant_config_str):
         group_size = int(group_size.group(1))
