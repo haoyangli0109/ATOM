@@ -245,6 +245,74 @@ class CompilationConfig:
                 "aiter.mla_attention",
             ]
 
+class QuantizationConfig1():
+    def __init__(self, config: PretrainedConfig):
+        self.torch_dtype = getattr(config, "torch_dtype", "bf16")
+        self.hf_quant_config = getattr(config, "quantization_config", None)
+
+        # parse quant_config
+        self.quant_method = self.hf_quant_config.get("quant_method", None)
+        if self.quant_method == "quark":
+            from typing import TYPE_CHECKING, Any, Optional, cast
+            self.layer_quant_config = cast(
+                dict[str, Any], self.hf_quant_config.get("layer_quant_config")
+            )
+            self.global_quant_config = cast(
+                dict[str, Any], self.hf_quant_config.get("global_quant_config")
+            )
+            self.exclude_layers = cast(list[str], self.hf_quant_config.get("exclude"))
+
+        # For dpsk
+        elif self.quant_method == "fp8":
+            pass
+        # For gpt_oss
+        elif self.quant_method == "mxfp4":
+            pass
+        elif self.quant_method == "compressed-tensors":
+            pass
+
+    def should_ignore_layer_quant(self, layer_name: str) -> bool:
+        # TODO: solve fused_mapping case
+        if layer_name is None:
+            return False
+        return any(self.is_equal_or_regex_match(layer_name, ignore_str) for ignore_str in self.exclude_layers)
+
+    def is_equal_or_regex_match(self, layer_name: str, ignore_str: str, check_contains: bool = False) -> bool:   
+        '''Match the target string or regular expression'''
+        if ignore_str.startswith("re:"):
+            pattern = ignore_str[3:]
+        if re.match(pattern, layer_name):
+            return True
+        elif check_contains:
+            if ignore_str.lower() in layer_name.lower():
+                return True
+        elif ignore_str == layer_name:
+            return True
+        return False
+
+    def get_layer_quant_config(self, layer_name: str):
+        if self.should_ignore_layer_quant(layer_name=layer_name):
+            return QuantType.No, self.torch_dtype # ???
+        # layer quant config
+        layer_quant_config = None
+        if self.layer_quant_config:
+            import fnmatch
+            def _matches_pattern(layer_name, pattern):
+                if "*" not in pattern:
+                    return layer_name in pattern
+                return fnmatch.fnmatch(layer_name, pattern)
+
+            for name_pattern, config in self.layer_quant_config.items():
+                if _matches_pattern(layer_name, name_pattern):
+                    layer_quant_config = config
+        quant_config = self.global_quant_config if layer_quant_config is None else layer_quant_config
+        # parse quant_config
+        if self.quant_method == "quark":
+            pass
+        elif self.quant_method == "compressed-tensors":
+            pass
+        # return a dict
+        return 
 
 class QuantizationConfig(dict):
     def __init__(
