@@ -201,7 +201,10 @@ def load_model(
                     param_name = name.replace(k, v)
                     # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
                     if "output_scale" not in param_name:
-                        param = model.get_parameter(param_name)
+                        try:
+                            param = model.get_parameter(param_name)
+                        except: 
+                            pass
                         weight_loader = getattr(param, "weight_loader")
                         # weight_loader(param, weight_tensor, shard_id)
                         futures.append(

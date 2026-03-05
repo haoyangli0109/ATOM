@@ -17,7 +17,7 @@ from aiter import (
 )
 from torch import nn
 
-from atom.config import QuantizationConfig, get_current_atom_config
+from atom.config import QuantizationConfig, get_current_atom_config, LayerQuantConfig
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 from atom.models.utils import get_quant_config_for_layer
 
@@ -200,12 +200,15 @@ class LinearBase(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = False,
         source_quant_dtype: torch.dtype | None = None,
+        prefix: str = "",
     ):
         if quant_config is None:
-            quant_config = QuantizationConfig()
+            layer_quant_config = LayerQuantConfig()
+        else:
+            layer_quant_config = quant_config.get_layer_quant_config(prefix)
         self.source_quant_dtype = source_quant_dtype
-        quant_type = quant_config["quant_type"]
-        params_dtype = quant_config["quant_dtype"]
+        quant_type = layer_quant_config["quant_type"]
+        params_dtype = layer_quant_config["quant_dtype"]
         super().__init__()
         self.reduce_results = reduce_results
         self.input_size = input_size
@@ -259,7 +262,7 @@ class LinearBase(nn.Module):
                     torch.empty(len(self.output_partition_sizes), 1, dtype=dtypes.fp32),
                     requires_grad=False,
                 )
-                if not quant_config["is_dynamic"]:
+                if not layer_quant_config["is_dynamic"]:
                     self.input_scale = nn.Parameter(
                         torch.empty(
                             len(self.output_partition_sizes), 1, dtype=dtypes.fp32
@@ -451,6 +454,7 @@ class ReplicatedLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         super().__init__(
@@ -460,6 +464,7 @@ class ReplicatedLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=prefix
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -475,6 +480,7 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.tp_dim = 0
@@ -485,6 +491,7 @@ class ColumnParallelLinear(LinearBase):
             bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -507,8 +514,6 @@ class MergedColumnParallelLinear(LinearBase):
         **kwargs,
     ):
         self.output_sizes = output_sizes
-        if quant_config is not None and prefix:
-            quant_config = get_quant_config_for_layer(quant_config, prefix)
         super().__init__(
             input_size,
             output_sizes,
@@ -516,6 +521,7 @@ class MergedColumnParallelLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=prefix
         )
 
     def weight_loader(
@@ -551,6 +557,7 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.head_k_dim = head_k_dim
@@ -571,6 +578,7 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=prefix
         )
 
     def weight_loader(
@@ -619,6 +627,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.head_size = head_size
@@ -650,6 +659,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
         )
 
     def weight_loader(
@@ -701,8 +711,6 @@ class RowParallelLinear(LinearBase):
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
-        if quant_config is not None and prefix:
-            quant_config = get_quant_config_for_layer(quant_config, prefix)
         super().__init__(
             input_size,
             output_size,
@@ -711,6 +719,7 @@ class RowParallelLinear(LinearBase):
             quant_config=quant_config,
             reduce_results=reduce_results,
             source_quant_dtype=source_quant_dtype,
+            prefix=prefix
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -737,6 +746,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.output_sizes = output_size
@@ -746,6 +756,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=prefix
         )
 
     def weight_loader(

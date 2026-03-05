@@ -1946,8 +1946,7 @@ class FusedMoE(torch.nn.Module):
         )
         self.moe_config = moe
 
-        if quant_config is not None and prefix:
-            quant_config = get_quant_config_for_layer(quant_config, prefix)
+
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
