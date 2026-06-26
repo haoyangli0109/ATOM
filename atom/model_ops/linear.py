@@ -32,7 +32,11 @@ from atom.model_ops.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-from atom.quantization.quark.utils import weight_dequant_fp8, weight_dequant_mxfp8
+from atom.quantization.quark.utils import (
+    quant_mxfp4_online_even,
+    weight_dequant_fp8,
+    weight_dequant_mxfp8,
+)
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -519,9 +523,16 @@ class LinearBase(nn.Module):
         elif self.quant_type == QuantType.per_1x32:
             # dequant MXFP8 (FP8 elements + 1x32 E8M0 shared scale)
             weight = weight_dequant_mxfp8(weight, weight_scale)
-        q_weight, weight_scale = online_quant_func(
-            weight, quant_dtype=online_quant_dtype
-        )
+
+        if online_quant_dtype == dtypes.fp4x2:
+            # MXFP4 online quant (shared with the MoE path).
+            q_weight, weight_scale = quant_mxfp4_online_even(weight)
+        else:
+            # FP8 (incl. ptpc_fp8 per-token / per-channel) keeps using the
+            # aiter quant function from ``get_hip_quant`` (``online_quant_func``).
+            q_weight, weight_scale = online_quant_func(
+                weight, quant_dtype=online_quant_dtype
+            )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
                 q_weight, weight_scale

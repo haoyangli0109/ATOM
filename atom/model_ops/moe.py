@@ -52,7 +52,11 @@ from atom.model_ops.utils import (
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
-from atom.quantization.quark.utils import weight_dequant_fp8, weight_dequant_mxfp8
+from atom.quantization.quark.utils import (
+    quant_mxfp4_online_even,
+    weight_dequant_fp8,
+    weight_dequant_mxfp8,
+)
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
@@ -2525,6 +2529,15 @@ class FusedMoE(torch.nn.Module):
                 return weight_dequant_mxfp8(w.contiguous(), sc.contiguous())
             return weight_dequant_fp8(w.contiguous(), sc.contiguous())
 
+        # MXFP4 online quant (shared with the Linear path).
+        if online_quant_dtype == dtypes.fp4x2:
+            _quant_weight = quant_mxfp4_online_even
+        else:
+            # FP8 (incl. ptpc_fp8 per-token / per-channel) keeps using the
+            # aiter quant function from ``get_hip_quant`` (``quant_func``).
+            def _quant_weight(w):
+                return quant_func(w, quant_dtype=online_quant_dtype)
+
         # Determine whether each weight needs all_gather to match offline quantization.
         # w13 (column parallel): (E, (2*intermediate/tp, hidden)) — TP dim 0
         # w2  (row parallel):    (E, (hidden, intermediate/tp)) — TP dim 1
@@ -2592,8 +2605,8 @@ class FusedMoE(torch.nn.Module):
                 w1_bf16 = w13_local[:w1_size]
                 w3_bf16 = w13_local[w1_size:]
 
-            w1_q, w1_s = quant_func(w1_bf16, quant_dtype=online_quant_dtype)
-            w3_q, w3_s = quant_func(w3_bf16, quant_dtype=online_quant_dtype)
+            w1_q, w1_s = _quant_weight(w1_bf16)
+            w3_q, w3_s = _quant_weight(w3_bf16)
             del w1_bf16, w3_bf16
 
             w13_expert = self.w13_weight.data[expert_id]
@@ -2629,10 +2642,10 @@ class FusedMoE(torch.nn.Module):
                 )
             if need_gather_w2:
                 w2_full = tp_group.all_gather(w2_local, dim=1)
-                w2_q, w2_s = quant_func(w2_full, quant_dtype=online_quant_dtype)
+                w2_q, w2_s = _quant_weight(w2_full)
                 del w2_full
             else:
-                w2_q, w2_s = quant_func(w2_local, quant_dtype=online_quant_dtype)
+                w2_q, w2_s = _quant_weight(w2_local)
 
             self._load_model_weight_or_group_weight_scale(
                 shard_dim=1,

@@ -124,3 +124,30 @@ def weight_dequant_mxfp8(
     y = x.to(torch.float32).reshape(M, n_blocks, block_size)
     y = y * scale.unsqueeze(-1)
     return y.reshape(M, K).to(out_dtype)
+
+
+def quant_mxfp4_online_even(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Online MXFP4 weight quant via the aiter HIP kernel with ``Even`` round mode.
+
+    Round-half-to-even on the FP4/E2M1 grid + an E8M0 block scale (note: on
+    gfx942 ``Even`` falls back to round-half-away in software). Returns the
+    packed weight viewed as ``dtypes.fp4x2`` and the block scale as
+    ``dtypes.fp8_e8m0``.
+
+    Shared by the Linear and MoE online-quant paths so both stay in sync.
+    ``quant_mxfp4_hip`` requires a 2D contiguous fp16/bf16 input, so we
+    normalise the input accordingly before calling it.
+    """
+    from aiter import dtypes
+    from aiter.ops.quant import quant_mxfp4_hip
+    from aiter.utility.mx_types import MxScaleRoundModeInt
+
+    q_in = weight.contiguous()
+    if q_in.dtype not in (torch.float16, torch.bfloat16):
+        q_in = q_in.to(torch.bfloat16)
+    q_weight, weight_scale = quant_mxfp4_hip(
+        q_in, round_mode=MxScaleRoundModeInt.Even
+    )
+    return q_weight.view(dtypes.fp4x2), weight_scale.view(dtypes.fp8_e8m0)
