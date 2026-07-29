@@ -13,6 +13,7 @@ AITER build, and `loader.py` imports AITER at module level.
 import concurrent.futures
 import logging
 from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -25,6 +26,9 @@ from atom.model_loader.weight_names import (
     WeightsMapper,
 )
 from atom.utils import envs
+
+if TYPE_CHECKING:
+    from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
 
 logger = logging.getLogger("atom")
 
@@ -43,6 +47,7 @@ def load_weights_into_model(
     fuse_shared_expert: Callable[[str, str], bool],
     is_rank0: Callable[[], bool],
     weights_iterator: Callable[..., Iterable[tuple[str, torch.Tensor]]],
+    streamer: "OnlineQuantStreamer | None" = None,
 ) -> set[str]:
     """Copy every checkpoint tensor into the model parameter it belongs to.
 
@@ -53,6 +58,10 @@ def load_weights_into_model(
     - ``fuse_shared_expert``     ``(shared_prefix, routed_prefix) -> fuse?``
     - ``is_rank0``               suppress duplicate diagnostics off rank 0
     - ``weights_iterator``       ``(path, disable_mmap, wants) -> (name, tensor)``
+
+    ``streamer`` is the online-quant streaming driver, or None for the classic
+    load-everything-then-quantize path. When present it takes over the
+    single-threaded write path so it can tell when a module is complete.
     """
 
     def _n_routed_experts() -> int | None:
@@ -99,6 +108,8 @@ def load_weights_into_model(
         ),
     )
     params_dict = dict(model.named_parameters())
+    if streamer is not None:
+        streamer.bind_params_dict(params_dict)
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
     # Original code does O(N) scan of expert_mapping (768 entries) per tensor,
     # causing ~19s of CPU time for 90k expert tensors. This reduces it to O(1).
@@ -130,6 +141,9 @@ def load_weights_into_model(
     staging_pool = ExpertStagingPool(_lookup_moe_module)
 
     num_threads = envs.ATOM_LOADER_NUM_THREADS
+    if streamer is not None:
+        num_threads = streamer.resolve_num_threads(num_threads)
+        streamer.start_workers()
     if num_threads > 1:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
     else:
@@ -139,6 +153,8 @@ def load_weights_into_model(
     def _submit(fn, *args):
         if executor is not None:
             futures.append(executor.submit(fn, *args))
+        elif streamer is not None:
+            streamer.run(fn, args)
         else:
             fn(*args)
 
@@ -159,6 +175,7 @@ def load_weights_into_model(
         detect_fused_expert_fn=getattr(model, "detect_fused_expert_format", None),
         get_fused_expert_mapping_fn=getattr(model, "get_fused_expert_mapping", None),
         load_fused_expert_weights_fn=load_fused_expert_weights_fn,
+        on_fused_param=None if streamer is None else streamer.materialize_fused_param,
     )
 
     # Rewriting a name is the same question as "is this tensor wanted", and the
@@ -199,6 +216,9 @@ def load_weights_into_model(
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
+        if streamer is not None:
+            streamer.drain()
+
         loaded_weights_record = dispatcher.loaded_weights_record
         dropped_ckpt_keys = dispatcher.dropped_ckpt_keys
 
@@ -224,6 +244,8 @@ def load_weights_into_model(
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
+        if streamer is not None:
+            streamer.shutdown()
 
     _report_coverage(
         loaded_weights_record=loaded_weights_record,
@@ -234,6 +256,8 @@ def load_weights_into_model(
     )
 
     # Avoid holding stale Parameter refs that prevent storage release.
+    if streamer is not None:
+        streamer.release_params_dict()
     del params_dict
 
     return loaded_weights_record

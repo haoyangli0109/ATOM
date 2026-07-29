@@ -32,7 +32,11 @@ from atom.model_ops.utils import (
     requantize_with_max_scale,
     shuffle_weights,
 )
-from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
+from atom.quant_spec import (
+    LayerQuantConfig,
+    should_skip_online_quant,
+    should_stream_online_quant,
+)
 from atom.quantization.quark.utils import (
     dequant_weight_online,
     quant_weight_online,
@@ -416,10 +420,31 @@ class LinearBase(nn.Module):
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
 
+        # Decide whether this layer streams its online quantization: quantize it
+        # right after its weights finish loading (freeing the source BF16),
+        # instead of loading the whole model then quantizing. Same decision as
+        # FusedMoE (see quant_spec.should_stream_online_quant). When enabled the
+        # weight is allocated on the meta device and the loader materializes it
+        # on first touch (see model_loader/loader.py).
+        self._stream_online = self.source_quant_dtype is None and (
+            should_stream_online_quant(quant_config, prefix, quant_type, params_dtype)
+        )
+        # Capture the intended device now: the model is constructed under
+        # `set_default_device(self.device)`, but by load time the default is
+        # reset, so we must remember where to materialize.
+        self._load_device = torch.empty(0).device if self._stream_online else None
+        # Single switch for every parameter allocated below. A streaming layer
+        # starts entirely on meta -- weight, bias and scales alike -- so it costs
+        # no real memory until the loader materializes each param on first touch;
+        # `None` means "default device", i.e. the classic behaviour.
+        param_device = "meta" if self._stream_online else None
+
         if self.source_quant_dtype is not None:
             weight_size = (self.output_size, self.input_size)
             self.weight = atom_parameter(
-                torch.empty(weight_size, dtype=self.source_quant_dtype)
+                torch.empty(
+                    weight_size, dtype=self.source_quant_dtype, device=param_device
+                )
             )
         else:
             weight_size = (
@@ -427,10 +452,14 @@ class LinearBase(nn.Module):
                 if params_dtype not in [dtypes.fp4x2, dtypes.i4x2]
                 else (self.output_size, self.input_size // 2)
             )
-            self.weight = atom_parameter(torch.empty(weight_size, dtype=params_dtype))
+            self.weight = atom_parameter(
+                torch.empty(weight_size, dtype=params_dtype, device=param_device)
+            )
         if bias:
             output_type = get_current_atom_config().torch_dtype
-            self.bias = atom_parameter(torch.empty(self.output_size, dtype=output_type))
+            self.bias = atom_parameter(
+                torch.empty(self.output_size, dtype=output_type, device=param_device)
+            )
             self.bias.weight_loader_process = self.weight_loader_process
         else:
             self.register_parameter("bias", None)
@@ -440,19 +469,29 @@ class LinearBase(nn.Module):
         if quant_type != QuantType.No and self.source_quant_dtype is None:
             if quant_type == QuantType.per_Tensor:
                 self.weight_scale = atom_parameter(
-                    torch.empty(len(self.output_partition_sizes), 1, dtype=dtypes.fp32)
+                    torch.empty(
+                        len(self.output_partition_sizes),
+                        1,
+                        dtype=dtypes.fp32,
+                        device=param_device,
+                    )
                 )
                 if not layer_quant_config.is_dynamic:
                     self.input_scale = atom_parameter(
                         torch.empty(
-                            len(self.output_partition_sizes), 1, dtype=dtypes.fp32
+                            len(self.output_partition_sizes),
+                            1,
+                            dtype=dtypes.fp32,
+                            device=param_device,
                         )
                     )
                     self.input_scale.weight_loader_process = self.weight_loader_process
                     self.input_scale.weight_loader = self.weight_loader
             elif quant_type == QuantType.per_Token:
                 self.weight_scale = atom_parameter(
-                    torch.empty(self.output_size, 1, dtype=dtypes.fp32)
+                    torch.empty(
+                        self.output_size, 1, dtype=dtypes.fp32, device=param_device
+                    )
                 )
             elif quant_type == QuantType.per_1x128:
                 scale_dtype = (
@@ -465,6 +504,7 @@ class LinearBase(nn.Module):
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
                         dtype=scale_dtype,
+                        device=param_device,
                     )
                 )
             elif quant_type == QuantType.per_1x32:
@@ -473,6 +513,7 @@ class LinearBase(nn.Module):
                         self.output_size,
                         (self.input_size + 31) // 32,
                         dtype=dtypes.fp8_e8m0,
+                        device=param_device,
                     )
                 )
             self.weight.weight_loader_process = self.weight_loader_process

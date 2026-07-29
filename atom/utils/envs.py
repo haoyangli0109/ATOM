@@ -208,6 +208,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
     ),
+    # Stream online quantization during weight loading. When set, each eligible
+    # Linear layer (unquantized/BF16 source re-quantized to an online target) is
+    # allocated on the meta device at construction, materialized when its weights
+    # finish loading, quantized immediately, and its source BF16 freed -- instead
+    # of loading the whole BF16 model then quantizing it in a second pass. This
+    # lowers peak load-time memory for `--online_quant_config`. The checkpoint
+    # walk itself is forced single-threaded while active (the per-module
+    # arrival accounting is not shared-state safe); the expensive per-module
+    # tail -- H2D copy + quantization -- is handed to the worker pool sized by
+    # ATOM_ONLINE_QUANT_STREAMING_THREADS. Default off.
+    "ATOM_ONLINE_QUANT_STREAMING": lambda: (
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING", "0").lower() in ("1", "true")
+    ),
+    # Worker threads that run the streaming tail (materialize on GPU, replay the
+    # buffered copies, quantize, free the source) while the main thread keeps
+    # walking the checkpoint. 0 runs it inline on the main thread (the original
+    # fully serial behaviour). Raising it overlaps more GPU work with checkpoint
+    # reading but also keeps more modules in flight, so both host RAM (buffered
+    # sources) and device memory peaks grow roughly linearly with it.
+    "ATOM_ONLINE_QUANT_STREAMING_THREADS": lambda: int(
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING_THREADS", "4")
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

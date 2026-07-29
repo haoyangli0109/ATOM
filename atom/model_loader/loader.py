@@ -24,6 +24,7 @@ if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_loader.loading_core import load_weights_into_model
+from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
 from atom.model_loader.weight_iterator import (
     safetensors_weights_iterator,
 )
@@ -272,6 +273,12 @@ def load_model(
         except Exception:  # noqa: BLE001
             return True
 
+    # Online-quant streaming: quantize each eligible Linear right after its
+    # weights load, freeing the source BF16 (see LinearBase._stream_online).
+    # None when the feature is off or no module opted in, which leaves the
+    # classic load-everything-then-quantize path untouched.
+    streamer = OnlineQuantStreamer.maybe_create(model, load_dummy)
+
     loaded_weights_record = load_weights_into_model(
         model=model,
         model_name_or_path=model_name_or_path,
@@ -285,12 +292,16 @@ def load_model(
         fuse_shared_expert=_fuse_shared_expert,
         is_rank0=_is_rank0,
         weights_iterator=safetensors_weights_iterator,
+        streamer=streamer,
     )
 
     # Dummy modes other than "empty" fill the skipped-load params with finite
     # values before post-processing, so shuffle/swizzle runs on clean constants.
     if load_dummy and load_dummy != "empty":
         initialize_dummy_weights(model, load_dummy)
+
+    if streamer is not None:
+        streamer.replay_stragglers_and_report(_is_rank0())
 
     has_online_quant = any(
         getattr(m, "online_quant", False)
@@ -304,8 +315,16 @@ def load_model(
         logger.info("Weight post-processing started (includes online quantization)")
     pp_start = time.perf_counter()
 
+    streamed_done = streamer.done_module_ids if streamer is not None else frozenset()
     for module_name, module in model.named_modules():
-        if hasattr(module, "process_weights_after_loading"):
+        # Streaming already ran this module's own process_weights_after_loading
+        # during the load loop; re-running it would double-shuffle/normalize.
+        # Only that single call is skipped -- the quant_method hooks below are a
+        # separate mechanism and must still run.
+        if (
+            hasattr(module, "process_weights_after_loading")
+            and id(module) not in streamed_done
+        ):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
 
@@ -347,6 +366,19 @@ def load_model(
             model_name_or_path,
             pp_elapsed,
             raw_online_quant_config or {},
+        )
+
+    # Peak allocated across load *and* post-processing. It has to span both, or
+    # the two modes aren't comparable: streaming quantizes inside the load loop
+    # while the classic path does it in the post-load pass above. Logged here
+    # rather than read off the KV-cache budget line, whose ``peak_torch`` comes
+    # after ``warmup_model`` resets the high-water mark and so says nothing
+    # about loading -- which is precisely what streaming exists to lower.
+    if torch.cuda.is_available() and _is_rank0():
+        logger.info(
+            "Weight loading peak GPU memory: %.2f GB (streaming=%s)",
+            torch.cuda.max_memory_allocated() / (1 << 30),
+            streamer is not None,
         )
 
     return loaded_weights_record
