@@ -13,6 +13,11 @@ from atom.model_ops.fla_ops import (
     fused_recurrent_gated_delta_rule,
     gdn_decode_update_lossy_fast,
 )
+from atom.model_ops.fla_ops.leapquant import (
+    leapquant_gated_delta_rule,
+    leapquant_load_state,
+    leapquant_store_state,
+)
 from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -183,6 +188,9 @@ class GatedDeltaNet(nn.Module):
         # to hold are reconstructed from `replay_buf_*` on demand.
         ssm_state = layer_cache.v_cache
         use_replayssm = getattr(gdn_metadata, "replayssm", False)
+        # Under LeapQuant `ssm_state` is the int8 residual of each boundary
+        # state; its scales and compensators ride alongside.
+        use_leapquant = getattr(gdn_metadata, "leapquant", False)
         flydsl_policy = self.gdn_flydsl_policy
 
         has_initial_state = gdn_metadata.has_initial_state
@@ -447,6 +455,11 @@ class GatedDeltaNet(nn.Module):
                     beta_non_spec,
                     flydsl_metadata,
                 )
+            if use_leapquant and ckpt is not None:
+                raise NotImplementedError(
+                    "ATOM_ENABLE_LEAPQUANT does not write prefix-cache state "
+                    "checkpoints; run with --no-enable_prefix_caching."
+                )
             if use_flydsl_prefill:
                 core_attn_out_non_spec, last_recurrent_state, flydsl_h = prefill(
                     query_non_spec,
@@ -462,7 +475,19 @@ class GatedDeltaNet(nn.Module):
                     has_initial_state=has_initial_state,
                 )
             else:
-                initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
+                if use_leapquant:
+                    # The cursor sits at the prefill sentinel: no records, so
+                    # the boundary is the whole state.
+                    initial_state = leapquant_load_state(
+                        ssm_state,
+                        layer_cache.leapquant_scale,
+                        layer_cache.leapquant_comp,
+                        non_spec_state_indices_in_tensor,
+                    )
+                else:
+                    initial_state = ssm_state[
+                        non_spec_state_indices_in_tensor
+                    ].contiguous()
                 initial_state[~has_initial_state, ...] = 0
                 core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
                     q=query_non_spec,
@@ -480,9 +505,18 @@ class GatedDeltaNet(nn.Module):
                     keep_intermediate_states=ckpt is not None,
                 )
             # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
+            if use_leapquant:
+                leapquant_store_state(
+                    last_recurrent_state,
+                    ssm_state,
+                    layer_cache.leapquant_scale,
+                    layer_cache.leapquant_comp,
+                    non_spec_state_indices_tensor,
+                )
+            else:
+                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
             # SSM state cache: copy out every checkpoint this step reached.
             #
             # A checkpoint slot is never where the recurrence runs — the live
@@ -530,6 +564,28 @@ class GatedDeltaNet(nn.Module):
                         non_spec_query_start_loc,
                         CHUNK_SIZE,
                     )
+        elif gdn_metadata.num_decodes > 0 and use_leapquant:
+            nd = gdn_metadata.num_decodes
+            core_attn_out_non_spec = leapquant_gated_delta_rule(
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                g=g_non_spec,
+                beta=beta_non_spec,
+                z=ssm_state,
+                sc=layer_cache.leapquant_scale,
+                comp=layer_cache.leapquant_comp,
+                buf_k=layer_cache.replay_buf_k,
+                buf_u=layer_cache.replay_buf_u,
+                buf_g=layer_cache.replay_buf_g,
+                write_pos=gdn_metadata.write_pos,
+                slot_idx=gdn_metadata.slot_idx[:nd],
+                cu_seqlens=non_spec_query_start_loc[: nd + 1],
+                max_query_len=gdn_metadata.replayssm_max_query_len,
+                use_qk_l2norm_in_kernel=True,
+                fold=False,
+            )
+            last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes
             core_attn_out_non_spec = replayssm_gated_delta_rule(

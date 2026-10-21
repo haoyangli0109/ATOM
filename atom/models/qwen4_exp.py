@@ -156,27 +156,31 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
     moe_parallel = experts.moe_parallel_config
     tp_rank = moe_parallel.tp_rank
     expert_map = getattr(experts, "expert_map", None)
+    num_routed = experts.expert_layout.num_routed
     if expert_map is None:
-        # A fused shared expert occupies slots past the routed ones.
-        expert_slice = slice(0, experts.expert_layout.num_routed)
+        expert_slice = slice(0, num_routed)
     else:
-        local = torch.nonzero(expert_map >= 0).flatten()
+        # Fused shared experts and the sentinel are appended past the routed ids.
+        local = torch.nonzero(expert_map[:num_routed] >= 0).flatten()
         first, last = int(local[0]), int(local[-1])
         if last - first + 1 != local.numel():
             raise NotImplementedError(
                 "Qwen3.8-Flash-Next expert loading needs a contiguous expert-parallel range"
             )
         expert_slice = slice(first, last + 1)
+    # A fused shared expert occupies the local slots past the routed ones.
+    num_local_routed = expert_slice.stop - expert_slice.start
 
     def stacked_w13(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         intermediate = param.data.shape[1] // 2
         full = loaded_weight.shape[1] // 2
         stacked = loaded_weight[expert_slice]
+        routed = param.data[:num_local_routed]
         for half in range(2):
             source = stacked.narrow(
                 1, half * full + tp_rank * intermediate, intermediate
             )
-            target = param.data.narrow(1, half * intermediate, intermediate)
+            target = routed.narrow(1, half * intermediate, intermediate)
             target.copy_(source.to(device=target.device, dtype=target.dtype))
 
     def stacked_w2(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -184,7 +188,9 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
         source = loaded_weight[expert_slice].narrow(
             2, tp_rank * intermediate, intermediate
         )
-        param.data.copy_(source.to(device=param.device, dtype=param.dtype))
+        param.data[:num_local_routed].copy_(
+            source.to(device=param.device, dtype=param.dtype)
+        )
 
     def wrap(param: nn.Parameter, stacked_loader):
         stock = param.weight_loader
