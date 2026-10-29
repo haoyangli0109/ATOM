@@ -47,7 +47,11 @@ __all__ = [
     "flush_threshold_ok",
     "replayssm_buffer_shapes",
     "replayssm_commit",
+    "replayssm_flush",
+    "replayssm_flushes_ahead",
     "replayssm_gated_delta_rule",
+    "replayssm_records_in_state",
+    "replayssm_replay_records",
     "replayssm_sigmoid_gating_delta_rule",
 ]
 
@@ -81,10 +85,18 @@ def _replay_dot_mode(record_dtype: torch.dtype) -> int:
 # Flush policy                                                                 #
 # --------------------------------------------------------------------------- #
 #
-# The predicate below is evaluated in two places -- the layer kernel (to decide
-# whether *this* step folds) and the commit kernel (to re-derive what the
+# The predicate below is evaluated in three places -- the layer kernels (to
+# decide whether *this* step folds), `replayssm_flush` (which does that fold
+# ahead of the layers instead on a single-token GDN step, see
+# `replayssm_flushes_ahead`) and the commit kernel (to re-derive what the
 # *previous* step decided, since the forward does not touch the cursor).  They
-# must agree exactly, so both call the same expression; do not inline a variant.
+# must agree exactly, so all use the same expression; do not inline a variant.
+#
+# A step that folds appends its k/g records at row 0, a row the fold reads.
+# The serial and KDA kernels split each head's V across programs that all read
+# those shared records, and nothing orders the programs of one launch, so on a
+# flush the k/g are stored by whichever slice finishes reading last
+# (`_last_reader`).  The UT kernel has one program per head and needs no care.
 #
 # Firing at `h + 2T > L` rather than `h + T > L` keeps at least one full window
 # free: a step that lands at h = L-T followed by a full accept would otherwise
@@ -95,6 +107,20 @@ def _replay_dot_mode(record_dtype: torch.dtype) -> int:
 def flush_threshold_ok(cache_len: int, max_query_len: int) -> bool:
     """`cache_len` must hold two full windows or the invariant above breaks."""
     return cache_len >= 2 * max_query_len
+
+
+def replayssm_flushes_ahead(max_query_len: int) -> bool:
+    """Whether `replayssm_gated_delta_rule` expects this step's fold done by
+    :func:`replayssm_flush` before it runs.
+
+    Single-token steps do: their kernel then carries no fold code, and on
+    Qwen3.8-Flash-Next's shapes a step measured 8-10% faster that way, the
+    second read of a flushed checkpoint included.  A 3-token verify window
+    flushes about one sequence in five per step instead of one in fifteen,
+    and there the same split measured 9-15% slower (KDA's kernel: 5-13% at
+    any window), so those kernels fold in place.
+    """
+    return max_query_len == 1
 
 
 def replayssm_buffer_shapes(
@@ -463,8 +489,402 @@ def replayssm_commit(
 
 
 # --------------------------------------------------------------------------- #
+# Flush kernel -- single-token GDN steps fold here, ahead of their layers      #
+# --------------------------------------------------------------------------- #
+
+
+@triton.jit(do_not_specialize=["N", "T_MAX", "CAP", "L"])
+def _replayssm_flush_kernel(
+    ckpt,
+    buf_k,
+    buf_u,
+    buf_g,
+    write_pos,
+    slot_idx,
+    N,
+    T_MAX,
+    CAP,
+    L,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BH: tl.constexpr,
+    stride_ckpt_layer: tl.constexpr,
+    stride_ckpt_slot: tl.constexpr,
+    stride_bufk_layer: tl.constexpr,
+    stride_bufk_slot: tl.constexpr,
+    stride_bufk_pos: tl.constexpr,
+    stride_bufk_hv: tl.constexpr,
+    stride_bufu_layer: tl.constexpr,
+    stride_bufu_slot: tl.constexpr,
+    stride_bufu_pos: tl.constexpr,
+    stride_bufu_hv: tl.constexpr,
+    stride_bufg_layer: tl.constexpr,
+    stride_bufg_slot: tl.constexpr,
+    stride_bufg_pos: tl.constexpr,
+    stride_bufg_hv: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    DOT_MODE: tl.constexpr,
+):
+    """One program per (v-slice, sequence x v-head), walking the layers.
+
+    Sequences whose record buffer is full fold it into their slice of every
+    layer's checkpoint; everyone else returns at once -- which is most of
+    them, so the layers are a loop and not a grid axis: as one (launched per
+    2 GiB of pool), 512 sequences x 36 GDN layers spent 0.44 ms a step just
+    reading cursors, where the loop spends 0.02 ms.  Nothing here writes a
+    record, so the slices of one head can run in any order.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    slot = tl.load(slot_idx + i_n).to(tl.int64)
+    if slot < 0:
+        return
+    h = tl.maximum(tl.load(write_pos + slot).to(tl.int32), 0)
+    if h + 2 * T_MAX <= CAP:
+        return
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    for i_l in range(L):
+        l64 = i_l.to(tl.int64)
+        p_s = (
+            ckpt
+            + l64 * stride_ckpt_layer
+            + slot * stride_ckpt_slot
+            + i_hv * K * V
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
+        mask_s = mask_k[:, None] & mask_v[None, :]
+        b_kw, b_ru, b_decay = _replay_tiles_kmajor(
+            buf_k + l64 * stride_bufk_layer,
+            buf_u + l64 * stride_bufu_layer,
+            buf_g + l64 * stride_bufg_layer,
+            slot,
+            h,
+            stride_bufk_slot,
+            stride_bufk_pos,
+            stride_bufk_hv,
+            stride_bufu_slot,
+            stride_bufu_pos,
+            stride_bufu_hv,
+            stride_bufg_slot,
+            stride_bufg_pos,
+            stride_bufg_hv,
+            i_hv,
+            o_k,
+            o_v,
+            mask_k,
+            mask_v,
+            K,
+            V,
+            BK,
+            BH,
+            IS_KDA,
+        )
+        b_s = tl.load(p_s, mask=mask_s, other=0.0).to(tl.float32)
+        b_s = b_s * b_decay[:, None]
+        b_s += _replay_dot(b_kw, b_ru, True, DOT_MODE)
+        tl.store(p_s, b_s.to(p_s.dtype.element_ty), mask=mask_s)
+
+
+def _layered(x: torch.Tensor, ndim: int) -> torch.Tensor:
+    """``x`` with a leading layer axis; a single layer's tensor gets a unit one."""
+    return x if x.ndim == ndim + 1 else x.unsqueeze(0)
+
+
+def replayssm_flush(
+    ckpt: torch.Tensor,
+    buf_k: torch.Tensor,
+    buf_u: torch.Tensor,
+    buf_g: torch.Tensor,
+    write_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    max_query_len: int,
+) -> None:
+    """Fold full record buffers into their checkpoints, before a step's layers.
+
+    For the steps :func:`replayssm_flushes_ahead` names.  Run after the step's
+    `replayssm_commit`, with the same ``max_query_len``, and before any layer.
+    Takes one layer's tensors or every layer's stacked on a leading axis
+    (``ckpt [L, slots, HV, K, V]`` and so on): the cursor is shared, so a
+    sequence flushes in every layer at the same step and one launch covers
+    them all.  A per-channel (KDA) gate gives ``buf_g`` a channel axis, as
+    ``buf_k`` has.
+    """
+    is_kda = buf_g.ndim == buf_k.ndim
+    tensors = (
+        _layered(ckpt, 4),
+        _layered(buf_k, 4),
+        _layered(buf_u, 4),
+        _layered(buf_g, 4 if is_kda else 3),
+    )
+    HV, cap, K = tensors[1].shape[2:]
+    V = tensors[2].shape[4]
+    assert tensors[0].shape[2:] == (HV, K, V)
+    assert tensors[0].stride()[2:] == (K * V, V, 1), (
+        "checkpoint heads must be contiguous"
+    )
+    N = slot_idx.numel()
+    if N == 0:
+        return
+    assert flush_threshold_ok(cap, max_query_len), (
+        f"replayssm cache_len={cap} must be >= 2*max_query_len={2 * max_query_len}"
+    )
+    BV = min(triton.next_power_of_2(V), 64)
+    strides = dict(
+        stride_ckpt_layer=tensors[0].stride(0), stride_ckpt_slot=tensors[0].stride(1)
+    )
+    for name, x in zip(("bufk", "bufu", "bufg"), tensors[1:]):
+        strides[f"stride_{name}_layer"] = x.stride(0)
+        strides[f"stride_{name}_slot"] = x.stride(1)
+        strides[f"stride_{name}_hv"] = x.stride(2)
+        strides[f"stride_{name}_pos"] = x.stride(3)
+    _replayssm_flush_kernel[(triton.cdiv(V, BV), N * HV)](
+        *tensors,
+        write_pos=write_pos,
+        slot_idx=slot_idx,
+        N=N,
+        T_MAX=max_query_len,
+        CAP=cap,
+        L=tensors[0].shape[0],
+        HV=HV,
+        K=K,
+        V=V,
+        BK=triton.next_power_of_2(K),
+        BV=BV,
+        BH=max(16, triton.next_power_of_2(cap - max_query_len)),
+        **strides,
+        IS_KDA=is_kda,
+        DOT_MODE=_replay_dot_mode(buf_u.dtype),
+        num_warps=1,
+        # Pipelining the layer loop aborts Triton's AMD backend (an LLVM
+        # `iota_range` assertion) on GDN's tiles once the pool is past 2 GiB.
+        num_stages=1,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Reading a slot outside its own decode loop                                   #
+# --------------------------------------------------------------------------- #
+#
+# A slot's state is its checkpoint plus the records the cursor covers, and a
+# prefix-cache checkpoint published between two decode steps is such a slot:
+# its records are part of the state it is filed under.  A prefill resuming
+# from it has no `replayssm_commit` of its own to count them, so it asks
+# `replayssm_records_in_state` and folds them in with `replayssm_replay_records`.
+
+
+def replayssm_records_in_state(
+    write_pos: torch.Tensor, slot_idx: torch.Tensor, cache_len: int
+) -> torch.Tensor:
+    """How many records belong to the state each slot holds, as int32 ``[N]``.
+
+    What `replayssm_commit` would advance the cursor to on the slot's next
+    forward, for a slot last written by a one-token decode: the prefix that
+    decode read plus the record it appended.  The prefill sentinel holds none.
+
+    Single-token decode only.  A speculative step's count is in the sampler,
+    which is why the scheduler never checkpoints one mid-generation.
+    """
+    pos = write_pos[slot_idx.clamp(min=0).long()]
+    n = torch.where(pos + 2 > cache_len, 0, pos) + 1
+    return torch.where((pos < 0) | (slot_idx < 0), 0, n).to(torch.int32)
+
+
+@triton.jit(do_not_specialize=["N"])
+def _replay_records_kernel(
+    state,
+    buf_k,
+    buf_u,
+    buf_g,
+    slot_idx,
+    num_records,
+    N,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BH: tl.constexpr,
+    stride_bufk_slot: tl.constexpr,
+    stride_bufk_pos: tl.constexpr,
+    stride_bufk_hv: tl.constexpr,
+    stride_bufu_slot: tl.constexpr,
+    stride_bufu_pos: tl.constexpr,
+    stride_bufu_hv: tl.constexpr,
+    stride_bufg_slot: tl.constexpr,
+    stride_bufg_pos: tl.constexpr,
+    stride_bufg_hv: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    V_FIRST: tl.constexpr,
+):
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    h = tl.load(num_records + i_n)
+    slot = tl.load(slot_idx + i_n).to(tl.int64)
+    if (h <= 0) | (slot < 0):
+        return
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    o_h = tl.arange(0, BH)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    m_s = mask_k[:, None] & mask_v[None, :]
+
+    p_g = buf_g + slot * stride_bufg_slot + i_hv * stride_bufg_hv
+    if IS_KDA:
+        # Per-K-channel gates: the decays are [BK] vectors on the key side.
+        # Summed with the same loads the loop below accumulates `b_cj` from:
+        # reduced out of a [BK, BH] tile instead, the total came back wrong
+        # for a few lanes in one launch in ~13 on ROCm (K-first, 4 warps).
+        p_g = p_g + o_k
+        b_ctot = tl.zeros([BK], dtype=tl.float32)
+        for j in range(0, h):
+            b_ctot += tl.load(p_g + j * stride_bufg_pos, mask=mask_k, other=0.0).to(
+                tl.float32
+            )
+        b_decay = exp(b_ctot)[:, None]
+    else:
+        b_ctot = tl.sum(
+            tl.load(p_g + o_h * stride_bufg_pos, mask=o_h < h, other=0.0).to(
+                tl.float32
+            ),
+            axis=0,
+        )
+        b_decay = exp(b_ctot)
+    p_s = state + (i_n * HV + i_hv).to(tl.int64) * K * V
+    if V_FIRST:
+        p_s = p_s + o_v[None, :] * K + o_k[:, None]
+    else:
+        p_s = p_s + o_k[:, None] * V + o_v[None, :]
+    b_s = tl.load(p_s, mask=m_s, other=0.0).to(tl.float32) * b_decay
+
+    p_k = buf_k + slot * stride_bufk_slot + i_hv * stride_bufk_hv + o_k
+    p_u = buf_u + slot * stride_bufu_slot + i_hv * stride_bufu_hv + o_v
+    b_cj = b_ctot * 0.0
+    for j in range(0, h):
+        if IS_KDA:
+            b_cj += tl.load(p_g + j * stride_bufg_pos, mask=mask_k, other=0.0).to(
+                tl.float32
+            )
+        else:
+            b_cj += tl.load(p_g + j * stride_bufg_pos).to(tl.float32)
+        b_kj = tl.load(p_k + j * stride_bufk_pos, mask=mask_k, other=0.0)
+        b_uj = tl.load(p_u + j * stride_bufu_pos, mask=mask_v, other=0.0)
+        b_s += (exp(b_ctot - b_cj) * b_kj.to(tl.float32))[:, None] * b_uj.to(
+            tl.float32
+        )[None, :]
+    tl.store(p_s, b_s.to(p_s.dtype.element_ty), mask=m_s)
+
+
+def replayssm_replay_records(
+    state: torch.Tensor,
+    buf_k: torch.Tensor,
+    buf_u: torch.Tensor,
+    buf_g: torch.Tensor,
+    slot_idx: torch.Tensor,
+    num_records: torch.Tensor,
+    block_v: int = 64,
+    v_first: bool = False,
+) -> torch.Tensor:
+    """Advance checkpoint states past their slots' first records, in place.
+
+    ``state [N, HV, K, V]`` holds the checkpoints of ``slot_idx`` (in any
+    float dtype, contiguous); row ``i`` becomes the state after the first
+    ``num_records[i]`` records of its slot, accumulated in fp32.  Rows with no
+    records, or a slot below 0, are left alone.  One layer's record buffers,
+    laid out as `replayssm_buffer_shapes` with a leading slot axis; a KDA
+    layer's ``buf_g`` carries a channel axis.  ``v_first`` for a state stored
+    ``[N, HV, V, K]``, as the fp32 KDA pool is.
+    """
+    N = slot_idx.numel()
+    if N == 0:
+        return state
+    is_kda = buf_g.ndim == 4
+    _, HV, cap, K = buf_k.shape
+    V = buf_u.shape[-1]
+    assert state.is_contiguous() and state.numel() == N * HV * K * V
+    BV = min(triton.next_power_of_2(V), block_v)
+    _replay_records_kernel[(triton.cdiv(V, BV), N * HV)](
+        state,
+        buf_k,
+        buf_u,
+        buf_g,
+        slot_idx,
+        num_records,
+        N,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=triton.next_power_of_2(K),
+        BV=BV,
+        BH=max(16, triton.next_power_of_2(cap)),
+        stride_bufk_slot=buf_k.stride(0),
+        stride_bufk_pos=buf_k.stride(2),
+        stride_bufk_hv=buf_k.stride(1),
+        stride_bufu_slot=buf_u.stride(0),
+        stride_bufu_pos=buf_u.stride(2),
+        stride_bufu_hv=buf_u.stride(1),
+        stride_bufg_slot=buf_g.stride(0),
+        stride_bufg_pos=buf_g.stride(2),
+        stride_bufg_hv=buf_g.stride(1),
+        IS_KDA=is_kda,
+        V_FIRST=v_first,
+        num_warps=4,
+    )
+    return state
+
+
+# --------------------------------------------------------------------------- #
 # Fused rebuild + decode/verify kernel                                         #
 # --------------------------------------------------------------------------- #
+
+
+@triton.jit
+def _last_reader(p_ticket):
+    """Whether this program is the last of its head's V slices to get here.
+
+    Each slice takes a ticket once every load it has issued has returned (the
+    `s_waitcnt`, which the compiler cannot move a load across), so no read of
+    the window can see what the last ticket's holder stores next.  That is
+    all the ticket has to order: an acq_rel one would also write back and
+    invalidate the L2 on CDNA, and measured 2-6x slower on a step where every
+    sequence flushes.  The holder hands the round back, which leaves the
+    counter as it was found even if a batch repeats a slot (a dummy batch
+    may) and the rounds interleave.
+    """
+    nv = tl.num_programs(0)
+    landed = tl.inline_asm_elementwise(
+        "s_waitcnt vmcnt(0) lgkmcnt(0)\n\tv_mov_b32 $0, $1",
+        "=v,v",
+        [tl.full([], 1, tl.int32)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    last = tl.atomic_add(p_ticket, landed, sem="relaxed") % nv == nv - 1
+    if last:
+        tl.atomic_add(p_ticket, -nv, sem="relaxed")
+    return last
+
+
+#: `_last_reader` counters, one per (slot, v-head) of a pool, zero between
+#: launches.
+_TICKETS: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _tickets(ckpt: torch.Tensor, hv: int) -> torch.Tensor:
+    key = (ckpt.device, ckpt.shape[0] * hv)
+    if key not in _TICKETS:
+        _TICKETS[key] = torch.zeros(key[1], dtype=torch.int32, device=ckpt.device)
+    return _TICKETS[key]
 
 
 @triton.jit(do_not_specialize=["N", "T_TOT", "T_MAX", "CAP"])
@@ -481,6 +901,7 @@ def _replayssm_fwd_kernel(
     buf_g,
     write_pos,
     slot_idx,
+    tickets,
     cu_seqlens,
     scale,
     N,
@@ -534,6 +955,10 @@ def _replayssm_fwd_kernel(
     # index a record row outside this slot.
     h = tl.maximum(h, 0)
     do_flush = h + 2 * T_MAX > CAP
+    if T1_FAST:
+        # A full buffer is already in the checkpoint (`replayssm_flush` ran
+        # ahead of this launch), so this step replays nothing.
+        h = tl.where(do_flush, 0, h)
     base = tl.where(do_flush, 0, h).to(tl.int64)
 
     o_k = tl.arange(0, BK)
@@ -649,14 +1074,6 @@ def _replayssm_fwd_kernel(
         b_ck += tl.sum(b_kwt * b_xk[:, None], 0)
         b_cq += tl.sum(b_kwt * b_xq[:, None], 0)
 
-        if do_flush:
-            tl.store(
-                p_s,
-                (b_s * b_decay + _replay_dot(b_kwt, b_ru, True, DOT_MODE)).to(
-                    p_s.dtype.element_ty
-                ),
-                mask=mask_k[:, None] & mask_v[None, :],
-            )
         if i_v == 0:
             p_bkt = (
                 buf_k
@@ -743,8 +1160,8 @@ def _replayssm_fwd_kernel(
         # bought ~0, because Triton stages the layout conversion through LDS
         # either way -- the record axis is the strided one in the buffer, whichever
         # orientation it is read in.  Not doing the GEMM is the way past it.
-        # A flush is the one step that still needs S_h as a value, and it is
-        # one step in `cap - 1`.
+        # A flush is the one step that still needs S_h as a value, one step in
+        # `cap - 1`, and `replayssm_flush` does it ahead of this launch.
         p_o = o + (bos * HV + i_hv) * V + o_v
         b_q = tl.load(q + (bos * H + i_h) * K + o_k, mask=mask_k, other=0.0).to(
             tl.float32
@@ -816,10 +1233,6 @@ def _replayssm_fwd_kernel(
                 )
             else:
                 tl.store(p_bg2 + i_hv * stride_bufg_hv, b_g.to(p_bg2.dtype.element_ty))
-
-        if do_flush:
-            b_h = b_s0 * b_decay[:, None] + _replay_dot(b_kw, b_ru, True, DOT_MODE)
-            tl.store(p_ckpt_hv, b_h.to(p_ckpt_hv.dtype.element_ty), mask=mask_h)
         return
 
     # State is [BK, BV] here and the k tile arrives k-major, so the contraction
@@ -828,7 +1241,9 @@ def _replayssm_fwd_kernel(
     b_h += _replay_dot(b_kw, b_ru, True, DOT_MODE)
 
     # ---- 2. flush: the checkpoint absorbs the committed prefix --------------
+    writer = i_v == 0
     if do_flush:
+        writer = _last_reader(tickets + slot * HV + i_hv)
         tl.store(p_ckpt_hv, b_h.to(p_ckpt_hv.dtype.element_ty), mask=mask_h)
 
     # ---- 3. this step's tokens ---------------------------------------------
@@ -886,7 +1301,8 @@ def _replayssm_fwd_kernel(
         tl.store(p_bu, b_v.to(p_bu.dtype.element_ty), mask=mask_v)
         # k and g do not depend on the V split; let one program own the store
         # instead of having every V-block redundantly write the same bytes.
-        if i_v == 0:
+        # On a flush it is the last to read the window, which row 0 is in.
+        if writer:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1145,6 +1561,7 @@ def replayssm_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
     route: str = "auto",
+    fold: bool = True,
 ) -> torch.Tensor:
     """ReplaySSM forward for one linear-attention layer.
 
@@ -1163,6 +1580,9 @@ def replayssm_gated_delta_rule(
         route: ``"serial"`` walks tokens one at a time; ``"ut"`` uses the
             chunked delta-rule UT transform (scalar gate, non-headwise beta,
             multi-token steps only); ``"auto"`` picks ``"ut"`` when eligible.
+        fold: run this layer's flush (:func:`replayssm_flush`) first on the
+            steps that leave it to that (:func:`replayssm_flushes_ahead`).
+            False when the caller has already flushed every layer for them.
 
     Returns:
         ``o`` of shape ``[1, T_tot, HV, V]`` -- same leading-batch convention
@@ -1201,12 +1621,16 @@ def replayssm_gated_delta_rule(
         # Practical MTP windows (mtp_k = 1..3, i.e. T = 2..4) sit firmly on
         # the serial side, so `auto` only reaches for UT at long windows.
         route = "ut" if ut_eligible and max_query_len >= UT_MIN_QUERY_LEN else "serial"
+    if route == "ut" and not ut_eligible:
+        raise ValueError(
+            "replayssm route='ut' requires a scalar gate (not KDA), "
+            "non-headwise beta, and max_query_len > 1"
+        )
+    if fold and replayssm_flushes_ahead(max_query_len):
+        replayssm_flush(
+            ckpt, buf_k, buf_u, buf_g, write_pos, slot_idx[:N], max_query_len
+        )
     if route == "ut":
-        if not ut_eligible:
-            raise ValueError(
-                "replayssm route='ut' requires a scalar gate (not KDA), "
-                "non-headwise beta, and max_query_len > 1"
-            )
         # One program per (sequence, v-head): the [T, K] work (loads, l2norm,
         # the K.K^T and Q.K^T gemms) does not depend on the V split, so
         # splitting V would replicate it NV times.  Measured 2.9x worse at
@@ -1281,6 +1705,7 @@ def replayssm_gated_delta_rule(
         buf_g=buf_g,
         write_pos=write_pos,
         slot_idx=slot_idx,
+        tickets=_tickets(ckpt, HV),
         cu_seqlens=cu_seqlens,
         scale=scale,
         N=N,
@@ -1368,6 +1793,7 @@ def _replayssm_kda_fwd_kernel(
     buf_g,
     write_pos,
     slot_idx,
+    tickets,
     cu_seqlens,
     scale,
     LOWER_BOUND,
@@ -1463,7 +1889,9 @@ def _replayssm_kda_fwd_kernel(
     b_h = b_h * b_decay[None, :]
     b_h += _replay_dot(tl.trans(b_ru), b_kw, False, DOT_MODE)
 
+    writer = i_v == 0
     if do_flush:
+        writer = _last_reader(tickets + slot * HV + i_hv)
         tl.store(p_ckpt_hv, b_h.to(p_ckpt_hv.dtype.element_ty), mask=mask_h)
 
     # ---- 2. this step's tokens ---------------------------------------------
@@ -1505,7 +1933,7 @@ def _replayssm_kda_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_v.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if writer:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1604,6 +2032,7 @@ def replayssm_sigmoid_gating_delta_rule(
         buf_g=buf_g,
         write_pos=write_pos,
         slot_idx=slot_idx,
+        tickets=_tickets(ckpt, HV),
         cu_seqlens=cu_seqlens,
         scale=scale,
         LOWER_BOUND=0.0 if lower_bound is None else lower_bound,

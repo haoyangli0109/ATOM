@@ -17,8 +17,12 @@ from atom.model_ops.fla_ops.leapquant import (
     leapquant_gated_delta_rule,
     leapquant_load_state,
     leapquant_store_state,
+    leapquant_write_checkpoints,
 )
-from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
+from atom.model_ops.fla_ops.replayssm import (
+    replayssm_gated_delta_rule,
+    replayssm_replay_records,
+)
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -182,11 +186,12 @@ class GatedDeltaNet(nn.Module):
 
         gdn_cache = fwd_ctx.kv_cache_data
         layer_cache = gdn_cache[f"layer_{self.layer_num}"]
-        conv_state = layer_cache.k_cache
+        conv_state = layer_cache.k_cache # 短卷积需要的最近几个 token 的输入。
+        
         # Under ReplaySSM this pool holds one checkpoint per request rather
         # than one state per speculative token; the per-draft states it used
         # to hold are reconstructed from `replay_buf_*` on demand.
-        ssm_state = layer_cache.v_cache
+        ssm_state = layer_cache.v_cache # 线性注意力递推用的状态矩阵 [n, 24, 128, 128] 24个v头
         use_replayssm = getattr(gdn_metadata, "replayssm", False)
         # Under LeapQuant `ssm_state` is the int8 residual of each boundary
         # state; its scales and compensators ride alongside.
@@ -233,7 +238,8 @@ class GatedDeltaNet(nn.Module):
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
-
+        if ssm_state.shape[0] > 3:
+            pass
         use_lossy_gdn_decode = (
             envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST
             # The lossy fast path writes the full state back every step, which
@@ -363,7 +369,7 @@ class GatedDeltaNet(nn.Module):
             g_non_spec = None
             beta_non_spec = None
         else:
-            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias) # [1, 192, 24]
 
             if spec_sequence_masks is not None:
                 if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
@@ -409,6 +415,7 @@ class GatedDeltaNet(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
+                    fold=False,
                 )
                 last_recurrent_state = None
             else:
@@ -455,11 +462,6 @@ class GatedDeltaNet(nn.Module):
                     beta_non_spec,
                     flydsl_metadata,
                 )
-            if use_leapquant and ckpt is not None:
-                raise NotImplementedError(
-                    "ATOM_ENABLE_LEAPQUANT does not write prefix-cache state "
-                    "checkpoints; run with --no-enable_prefix_caching."
-                )
             if use_flydsl_prefill:
                 core_attn_out_non_spec, last_recurrent_state, flydsl_h = prefill(
                     query_non_spec,
@@ -476,8 +478,6 @@ class GatedDeltaNet(nn.Module):
                 )
             else:
                 if use_leapquant:
-                    # The cursor sits at the prefill sentinel: no records, so
-                    # the boundary is the whole state.
                     initial_state = leapquant_load_state(
                         ssm_state,
                         layer_cache.leapquant_scale,
@@ -488,6 +488,18 @@ class GatedDeltaNet(nn.Module):
                     initial_state = ssm_state[
                         non_spec_state_indices_in_tensor
                     ].contiguous()
+                # A slot published between decode steps is its checkpoint
+                # plus records; everywhere else the count is 0.
+                resume_records = getattr(gdn_metadata, "replayssm_resume_records", None)
+                if resume_records is not None:
+                    replayssm_replay_records(
+                        initial_state,
+                        layer_cache.replay_buf_k,
+                        layer_cache.replay_buf_u,
+                        layer_cache.replay_buf_g,
+                        non_spec_state_indices_in_tensor,
+                        resume_records,
+                    )
                 initial_state[~has_initial_state, ...] = 0
                 core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
                     q=query_non_spec,
@@ -549,7 +561,8 @@ class GatedDeltaNet(nn.Module):
                     # One launch for both halves. `conv_state` is
                     # [slot, conv_dim, state_len] by here (see the transpose
                     # above) and shares `slots` with the SSM half, so the two
-                    # always describe the same token position.
+                    # always describe the same token position. The int8 pool
+                    # cannot take a copy, so LeapQuant quantises its half.
                     write_state_checkpoints(
                         h,
                         ssm_state,
@@ -563,7 +576,22 @@ class GatedDeltaNet(nn.Module):
                         gdn_metadata.ssm_chunk_offsets,
                         non_spec_query_start_loc,
                         CHUNK_SIZE,
+                        copy_ssm=not use_leapquant,
                     )
+                    if use_leapquant:
+                        leapquant_write_checkpoints(
+                            h,
+                            last_recurrent_state,
+                            ssm_state,
+                            layer_cache.leapquant_scale,
+                            layer_cache.leapquant_comp,
+                            ckpt["rows"],
+                            ckpt["slots"],
+                            ckpt["offs"],
+                            ckpt["is_end"],
+                            gdn_metadata.ssm_chunk_offsets,
+                            CHUNK_SIZE,
+                        )
         elif gdn_metadata.num_decodes > 0 and use_leapquant:
             nd = gdn_metadata.num_decodes
             core_attn_out_non_spec = leapquant_gated_delta_rule(
@@ -605,6 +633,7 @@ class GatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 is_kda=False,
                 route=gdn_metadata.replayssm_route,
+                fold=False,
             )
             last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0:

@@ -54,10 +54,16 @@ def builder(
         num_spec=num_spec,
         _state_shape_for_runner=lambda: (shape_k, shape_v),
         _state_dtypes=lambda: (dt_k, dt_v),
+        # Each would add planes, and so its own part of the id.
+        leapquant=False,
+        replayssm=False,
     )
-    stub._uses_paged_checkpoints = Builder._uses_paged_checkpoints.__get__(
-        stub, type(stub)
-    )
+    for name in (
+        "_uses_paged_checkpoints",
+        "_pool_state_dtypes",
+        "_checkpoint_carries_records",
+    ):
+        setattr(stub, name, getattr(Builder, name).__get__(stub, type(stub)))
     return stub
 
 

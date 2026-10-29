@@ -97,11 +97,27 @@ _TOKENIZE_BATCH = 4096
 _LENGTH_FIX_ROUNDS = 10
 
 
+def _model_vocab_size(model: str, trust_remote_code: bool) -> int | None:
+    """Rows of the model's embedding, or None if its config cannot be read.
+
+    A tokenizer can count ids the embedding has no row for: Kimi-Linear's
+    reserves two past its 163840, and a server fed one faults the GPU.
+    """
+    from transformers import AutoConfig
+
+    try:
+        config = AutoConfig.from_pretrained(model, trust_remote_code=trust_remote_code)
+    except Exception:  # noqa: BLE001 -- a hub id offline, a custom config, ...
+        return None
+    return getattr(config.get_text_config(), "vocab_size", None)
+
+
 def _round_trip_prompts(
     tokenizer: PreTrainedTokenizerBase,
     rng: np.random.Generator,
     token_id_lists: list[list[int]],
     target_lens: list[int],
+    vocab_size: int,
 ) -> tuple[list[str], list[int]]:
     """Decode ids to text, adjusting until each re-encodes to its target length.
 
@@ -137,12 +153,7 @@ def _round_trip_prompts(
                 token_lens[i] = target
                 continue
             if len(ids) < target:
-                ids = (
-                    ids
-                    + rng.integers(
-                        0, tokenizer.vocab_size, size=target - len(ids)
-                    ).tolist()
-                )
+                ids = ids + rng.integers(0, vocab_size, size=target - len(ids)).tolist()
             else:
                 ids = ids[:target]
             unresolved.append(i)
@@ -173,13 +184,15 @@ def sample_random_requests(
     use_chat_template: bool = False,
     apply_chat_template_fn: Callable = lambda x: x,
     seed: int = 0,
+    model_vocab_size: int | None = None,
 ) -> list[tuple[str, int, int]]:
     # A private generator rather than the global numpy one: sharing that makes
     # the dataset depend on whatever else drew from it first, so re-running the
     # same command need not produce the same prompts.
     rng = np.random.default_rng(seed)
+    vocab_size = min(tokenizer.vocab_size, model_vocab_size or tokenizer.vocab_size)
 
-    prefix_token_ids = rng.integers(0, tokenizer.vocab_size, size=prefix_len).tolist()
+    prefix_token_ids = rng.integers(0, vocab_size, size=prefix_len).tolist()
 
     if use_chat_template:
         chat_template_dummy = apply_chat_template_fn(
@@ -198,7 +211,7 @@ def sample_random_requests(
 
     input_lens = sample_uniform(input_len)
     output_lens = sample_uniform(output_len)
-    offsets = rng.integers(0, tokenizer.vocab_size, size=num_prompts)
+    offsets = rng.integers(0, vocab_size, size=num_prompts)
 
     input_requests = []
     mismatches = []
@@ -208,15 +221,13 @@ def sample_random_requests(
         stop = min(start + _TOKENIZE_BATCH, num_prompts)
         token_id_lists = [
             prefix_token_ids
-            + (
-                (offsets[i] + i + np.arange(input_lens[i])) % tokenizer.vocab_size
-            ).tolist()
+            + ((offsets[i] + i + np.arange(input_lens[i])) % vocab_size).tolist()
             for i in range(start, stop)
         ]
         target_lens = [prefix_len + input_lens[i] for i in range(start, stop)]
 
         prompts, prompt_lens = _round_trip_prompts(
-            tokenizer, rng, token_id_lists, target_lens
+            tokenizer, rng, token_id_lists, target_lens, vocab_size
         )
 
         if use_chat_template:
@@ -891,6 +902,7 @@ def main(args: argparse.Namespace):
             apply_chat_template_fn=apply_chat_template_fn,
             use_chat_template=args.use_chat_template,
             seed=args.seed,
+            model_vocab_size=_model_vocab_size(model_id, args.trust_remote_code),
         )
 
     else:

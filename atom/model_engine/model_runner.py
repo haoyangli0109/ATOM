@@ -129,6 +129,7 @@ support_model_arch_dict = {
     "KimiK3ForConditionalGeneration": (
         "atom.models.kimi_k3.KimiK3ForConditionalGeneration"
     ),
+    "KimiLinearForCausalLM": "atom.models.kimi_k3.KimiLinearForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",

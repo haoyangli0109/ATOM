@@ -813,6 +813,15 @@ class InputOutputProcessor:
             if isinstance(prompt_or_tokens, str)
             else prompt_or_tokens
         )
+        # A tokenizer can know ids the embedding has no row for (Kimi-Linear
+        # reserves two past its 163840), and looking one up faults the GPU.
+        vocab_size = getattr(self.config.hf_config, "vocab_size", 0)
+        top_id = max(tokens, default=-1)
+        if vocab_size and top_id >= vocab_size:
+            raise ValueError(
+                f"Token id {top_id} is out of vocabulary: the model embeds ids "
+                f"below {vocab_size}."
+            )
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:

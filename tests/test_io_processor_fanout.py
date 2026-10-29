@@ -49,6 +49,7 @@ def _reset_sequence_counter():
 def _make_processor() -> InputOutputProcessor:
     proc = InputOutputProcessor.__new__(InputOutputProcessor)
     proc.config = MagicMock()
+    proc.config.hf_config.vocab_size = 1000
     tokenizer = MagicMock()
     tokenizer.encode = MagicMock(side_effect=lambda s, **_: list(range(len(s))))
     proc.tokenizer = tokenizer
@@ -91,6 +92,14 @@ class TestPreprocessFanout:
         # produces diverse outputs across siblings.
         assert all(s.needs_independent_noise for s in seqs)
         assert all(s.parent_request_id == "chatcmpl-abc" for s in seqs)
+
+    def test_rejects_ids_the_embedding_has_no_row_for(self):
+        """Looking such an id up faults the GPU, so it must not get that far."""
+        proc = _make_processor()
+        with pytest.raises(ValueError, match="out of vocabulary"):
+            proc.preprocess_fanout([1, 2, 1000], SamplingParams(n=1))
+        assert proc.requests == {}
+        assert len(proc.preprocess_fanout([1, 2, 999], SamplingParams(n=1))) == 1
 
     def test_fanout_seq_ids_are_unique(self):
         proc = _make_processor()

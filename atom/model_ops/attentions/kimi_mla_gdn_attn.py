@@ -205,7 +205,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)
         shape_k, shape_v = self._state_shape_for_runner()
-        dt_k, dt_v = self._state_dtypes()
+        dt_k, dt_v = self._pool_state_dtypes()
         # Everything a reader needs to reassemble the image at the same byte
         # offsets. `order` is the one thing the shapes cannot say, and getting
         # it wrong puts every layer but the first in the wrong place; `spec`
@@ -217,6 +217,18 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         tail_shape = None if tail_shape_fn is None else tail_shape_fn()
         version = "v2" if tail_shape is not None else "v1"
         order = "conv-all-layers,ssm-all-layers"
+        if self.leapquant:
+            order += ",lq-scale-all-layers,lq-comp-all-layers"
+        if self._checkpoint_carries_records():
+            order += ",rec-k-all-layers,rec-u-all-layers,rec-g-all-layers,cursor"
+        extra_layout = ""
+        if self.leapquant:
+            extra_layout += f":leapquant=rank:{self.leapquant_rank}"
+        if self._checkpoint_carries_records():
+            extra_layout += (
+                f":records=cap:{self.replayssm_cache_len},"
+                f"dtype:{self._record_dtype()}"
+            )
         tail_layout = ""
         if tail_shape is not None:
             tail_bytes, tail_layers = tail_shape
@@ -231,6 +243,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":conv={tuple(shape_k)},{dt_k}"
             f":ssm={tuple(shape_v)},{dt_v}"
             f":order={order}"
+            f"{extra_layout}"
             f"{tail_layout}"
             f":tp={get_tp_group().world_size}"
             f":spec={self.num_spec}"
@@ -444,6 +457,8 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 replay_buf_k=(runner.replayssm_buf_k[row] if self.replayssm else None),
                 replay_buf_u=(runner.replayssm_buf_u[row] if self.replayssm else None),
                 replay_buf_g=(runner.replayssm_buf_g[row] if self.replayssm else None),
+                leapquant_scale=(runner.leapquant_scale[row] if self.leapquant else None),
+                leapquant_comp=(runner.leapquant_comp[row] if self.leapquant else None),
                 # KDA recurrent state: slot-addressed, not paged. Registered
                 # because the forward reads it from `kv_cache_data`, but
                 # excluded from every block-addressed transfer.

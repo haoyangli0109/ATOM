@@ -119,6 +119,7 @@ def write_state_checkpoints(
     chunk_offsets: torch.Tensor,
     cu_seqlens: torch.Tensor,
     chunk_size: int,
+    copy_ssm: bool = True,
 ) -> None:
     """Write both halves of every checkpoint this step reached, in one launch.
 
@@ -132,6 +133,10 @@ def write_state_checkpoints(
     intermediates (an interior position), 1 reads ``runtime_slots[i]`` (a
     position at the end of the row's tokens, which is only ever in the runtime
     slot). The conv half is the same window slice either way.
+
+    ``copy_ssm=False`` writes the conv half alone, for a pool whose state is
+    not a plain copy of ``h`` (LeapQuant's int8 one); the caller owes the SSM
+    half (`leapquant_write_checkpoints`) in the same step.
 
     Neither conv tensor may be assumed contiguous, so the conv half indexes by
     real strides. ``conv_state`` reaches us as a ``transpose(-1, -2)`` view of a
@@ -147,7 +152,7 @@ def write_state_checkpoints(
     d, state_len = conv_state.shape[1], conv_state.shape[2]
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
     BLOCK = 1024
-    nblk_ssm = triton.cdiv(hkv, BLOCK)
+    nblk_ssm = triton.cdiv(hkv, BLOCK) if copy_ssm else 0
     grid = (n, nblk_ssm + triton.cdiv(d, BLOCK))
     _copy_checkpoints_kernel[grid](
         h,

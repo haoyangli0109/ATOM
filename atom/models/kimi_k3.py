@@ -27,6 +27,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 # Dynamo-opaque custom op that dispatches the MoE between single- and dual-stream
 # forwards (shared with deepseek_v2/v4). Imported for the registration only.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules, qrep_tp_override
 from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
@@ -34,7 +35,13 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from atom.model_ops.fla_ops.leapquant import (
+    leapquant_load_state,
+    leapquant_sigmoid_gating_delta_rule,
+    leapquant_store_state,
+)
 from atom.model_ops.fla_ops.replayssm import (
+    replayssm_replay_records,
     replayssm_sigmoid_gating_delta_rule,
 )
 from atom.model_ops.layernorm import RMSNorm
@@ -110,6 +117,12 @@ def _normalize_kimi_config(config) -> None:
     )
     config.kimi_full_attn_layers = [int(i) - 1 for i in lin.get("full_attn_layers", [])]
     config.kimi_kda_layers = [int(i) - 1 for i in lin.get("kda_layers", [])]
+    # Kimi-Linear-48B-A3B, the open release K3's layers grew out of: SiLU
+    # FFNs, MLA with neither a q LoRA nor an output gate, and a low-rank KDA
+    # output gate (g_a_proj -> g_b_proj) where K3 has a full-rank g_proj. Its
+    # config names none of that, and K3 is SiTU throughout, so the activation
+    # is what tells the two apart.
+    config.kimi_linear_v1 = getattr(config, "hidden_act", None) == "silu"
 
     # Keep the logical Q/K head width available to shared model infrastructure.
     config.head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
@@ -122,13 +135,17 @@ def _normalize_kimi_config(config) -> None:
 
 def _kda_packed_modules_mapping(
     kda_layer_indices: list[int],
+    q_lora: bool = True,
 ) -> dict[str, tuple[str, int]]:
     mapping = {
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
-        ".q_a_proj": (".fused_qkv_a_proj", 0),
-        ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
     }
+    if q_lora:
+        # Without a q LoRA there is no q_a_proj to fuse with, and the kv half
+        # loads into its own kv_a_proj_with_mqa.
+        mapping[".q_a_proj"] = (".fused_qkv_a_proj", 0)
+        mapping[".kv_a_proj_with_mqa"] = (".fused_qkv_a_proj", 1)
     projection_names = ("q_proj", "k_proj", "v_proj", "g_proj")
     for layer_idx in kda_layer_indices:
         prefix = f".layers.{layer_idx}.self_attn."
@@ -235,7 +252,10 @@ class KimiRMSNormGated(nn.Module):
 
 def _sharded_vector_loader(tp_rank: int, tp_size: int):
     def loader(param: nn.Parameter, loaded_weight: torch.Tensor):
-        shard = loaded_weight.narrow(0, tp_rank * param.numel(), param.numel())
+        # Kimi-Linear stores A_log as [1, 1, heads, 1].
+        shard = loaded_weight.reshape(-1).narrow(
+            0, tp_rank * param.numel(), param.numel()
+        )
         param.data.copy_(shard.to(param.dtype).view_as(param))
 
     return loader
@@ -269,6 +289,10 @@ class KimiMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
+        if config.hidden_act == "silu":
+            self._fuse_act_quant = False
+            self.act_fn = SiluAndMul()
+            return
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
         # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8
@@ -292,9 +316,11 @@ class KimiMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
-        # act_fn always returns (activation, scale): (fp8, scale) when it fused the
-        # down_proj activation quant, else (bf16, None) so down_proj self-quantizes.
-        act, act_scale = self.act_fn(self.gate_up_proj(x, x_scale))
+        # SituAndMul always returns (activation, scale): (fp8, scale) when it
+        # fused the down_proj activation quant, else (bf16, None) so down_proj
+        # self-quantizes. SiluAndMul returns the bf16 activation alone.
+        act = self.act_fn(self.gate_up_proj(x, x_scale))
+        act, act_scale = act if isinstance(act, tuple) else (act, None)
         return self.down_proj(act, x_scale=act_scale)
 
 
@@ -346,14 +372,24 @@ class KimiSparseMoeBlock(nn.Module):
             topk_group=getattr(config, "topk_group", 1),
             scoring_func=config.moe_router_activation_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
-            activation=ActivationType.Situv2,
+            activation=(
+                ActivationType.Silu
+                if config.hidden_act == "silu"
+                else ActivationType.Situv2
+            ),
             config=config,
             prefix=f"{prefix}.experts",
             # inter=3072/TP8=384 is a 128-multiple; pad to 128 (not the 256
             # default) to avoid padding the MXFP4 MoE intermediate up to 512.
             pad_align=128,
         )
-        if getattr(config, "num_shared_experts", 0):
+        # A shared expert FusedMoE took as an extra expert slot (same quant as
+        # the routed ones, e.g. the all-bf16 Kimi-Linear) gets its weights there,
+        # so a standalone copy would run on weights nobody loads.
+        if (
+            getattr(config, "num_shared_experts", 0)
+            and not self.experts.num_fused_shared_experts
+        ):
             self.shared_experts = KimiMLP(
                 config,
                 intermediate_size=config.moe_intermediate_size
@@ -697,25 +733,43 @@ class KimiFullAttention(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_local_heads = self.num_heads // self.tp_size
 
-        self.fused_qkv_a_proj = MergedReplicatedLinear(
-            self.hidden_size,
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fused_qkv_a_proj",
-        )
-        self.q_a_layernorm = RMSNorm(
-            self.q_lora_rank, eps=1e-6, prefix=f"{prefix}.q_a_layernorm"
-        )
-        # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
-        self.q_b_proj = ColumnParallelLinear(
-            self.q_lora_rank,
-            self.num_heads * self.q_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.q_b_proj",
-            **qrep_tp_override(self.tp_size),
-        )
+        if self.q_lora_rank is None:
+            # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads * self.q_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_proj",
+                **qrep_tp_override(self.tp_size),
+            )
+            self.kv_a_proj_with_mqa = ReplicatedLinear(
+                self.hidden_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.kv_a_proj_with_mqa",
+            )
+        else:
+            self.fused_qkv_a_proj = MergedReplicatedLinear(
+                self.hidden_size,
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_qkv_a_proj",
+            )
+            self.q_a_layernorm = RMSNorm(
+                self.q_lora_rank, eps=1e-6, prefix=f"{prefix}.q_a_layernorm"
+            )
+            # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
+            self.q_b_proj = ColumnParallelLinear(
+                self.q_lora_rank,
+                self.num_heads * self.q_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_b_proj",
+                **qrep_tp_override(self.tp_size),
+            )
         self.kv_a_layernorm = RMSNorm(
             self.kv_lora_rank, eps=1e-6, prefix=f"{prefix}.kv_a_layernorm"
         )
@@ -726,12 +780,16 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
-        self.g_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads * self.v_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.g_proj",
+        self.g_proj = (
+            None
+            if config.kimi_linear_v1
+            else ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads * self.v_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_proj",
+            )
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -762,7 +820,7 @@ class KimiFullAttention(nn.Module):
             qk_head_dim=self.q_head_dim,
             v_head_dim=self.v_head_dim,
             rotary_emb=self.rotary_emb,
-            q_proj=self.q_b_proj,
+            q_proj=self.q_proj if self.q_lora_rank is None else self.q_b_proj,
             kv_b_proj=self.kv_b_proj,
             o_proj=nn.Identity(),
             indexer=None,
@@ -781,6 +839,16 @@ class KimiFullAttention(nn.Module):
             mla_modules=mla_modules,
             prefix=prefix,
         )
+
+        if self.q_lora_rank is None:
+            # Kimi-Linear-48B is bf16 throughout: no q_a norm to fuse a quant
+            # into, and no gate to fuse with o_proj's.
+            self.fuse_qknorm_quant = False
+            self.fuse_input_norm_quant = False
+            self.input_quant_prefix = f"{prefix}.q_proj"
+            self.fuse_sigmoid_mul_quant = False
+            self.o_proj_quant_type_value = QuantType.No.value
+            return
 
         qknorm_type, qknorm_dtype = _effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
@@ -826,6 +894,30 @@ class KimiFullAttention(nn.Module):
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
+
+        if self.q_lora_rank is None:
+            # The MLA module runs q_proj itself, on the normed hidden state.
+            kv_c, k_rope = torch.split(
+                self.kv_a_proj_with_mqa(hidden_states, hidden_states_scale),
+                [self.kv_lora_rank, self.qk_rope_head_dim],
+                dim=-1,
+            )
+            attn_out = self.attn(
+                hidden_states,
+                self.kv_a_layernorm(kv_c),
+                k_rope,
+                positions,
+                q_scale=hidden_states_scale,
+            )
+            if self.g_proj is None:
+                return self.o_proj(attn_out)
+            attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
+                attn_out,
+                self.g_proj(hidden_states, hidden_states_scale),
+                quant=self.fuse_sigmoid_mul_quant,
+                quant_type_value=self.o_proj_quant_type_value,
+            )
+            return self.o_proj(attn_out, x_scale=attn_scale)
 
         q_c, kv_c, k_rope = torch.split(
             self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
@@ -949,14 +1041,12 @@ class KimiKDAAttention(nn.Module):
         # The top-level model maps four separate checkpoint projections
         # directly into this fused [q | k | v | g] parameter. Mapping keys
         # include the KDA layer index so KimiFullAttention.g_proj is untouched.
+        # Kimi-Linear's output gate is low-rank instead: g_a_proj joins the
+        # fused tails below and g_b_proj runs after it, as f_b_proj does.
+        self.low_rank_out_gate = config.kimi_linear_v1
         self.in_proj = MergedColumnParallelLinear(
             self.hidden_size,
-            [
-                self.proj_size,
-                self.proj_size,
-                self.proj_size,
-                self.proj_size,
-            ],
+            [self.proj_size] * (3 if self.low_rank_out_gate else 4),
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj",
@@ -1020,6 +1110,21 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
+        if self.low_rank_out_gate:
+            self.g_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_a_proj",
+            )
+            self.g_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                self.proj_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_b_proj",
+            )
         o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
         self.o_norm = KimiRMSNormGated(
             self.head_dim,
@@ -1057,6 +1162,8 @@ class KimiKDAAttention(nn.Module):
 
     def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
         """Children that must remain unquantized until KDA fuses their weights."""
+        if self.low_rank_out_gate:
+            return self.in_proj, self.f_a_proj, self.g_a_proj
         return self.in_proj, self.f_a_proj
 
     def process_weights_after_loading(self) -> None:
@@ -1090,8 +1197,11 @@ class KimiKDAAttention(nn.Module):
             return
         # Order defines the forward-time slice boundaries below; keep in sync.
         # in_proj already holds the fused [q | k | v | g] (4 * local_proj_size);
-        # b_proj and f_a_proj are appended as the two tails.
+        # b_proj and f_a_proj are appended as the two tails. A low-rank output
+        # gate has no g there and appends g_a_proj as a third tail instead.
         tails = (self.b_proj, self.f_a_proj)
+        if self.low_rank_out_gate:
+            tails += (self.g_a_proj,)
         assert all(m.quant_type == QuantType.No for m in (self.in_proj, *tails)), (
             "KDA in-proj fusion assumes unquantized (bf16) attention weights; "
             "this checkpoint quantizes self_attn projections."
@@ -1129,6 +1239,7 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        state_v_first: bool = True,
     ):
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
@@ -1156,8 +1267,9 @@ class KimiKDAAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             # V-first state, matching the layout mamba_v_cache holds and the
             # fused decode kernel writes. Without it the state comes back
-            # K-first and decode reads it transposed.
-            state_v_first=True,
+            # K-first and decode reads it transposed. LeapQuant asks for
+            # K-first: that is how it quantises and decodes the state.
+            state_v_first=state_v_first,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1218,10 +1330,16 @@ class KimiKDAAttention(nn.Module):
         # transpose (channel-last: stride(0)==1), and causal_conv1d_update only
         # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
         mixed_qkv = fused_in[..., : 3 * lp]
-        out_gate = fused_in[..., 3 * lp : 4 * lp]
+        # Where the tails start: after the full-rank gate, if there is one.
+        tail = 3 * lp if self.low_rank_out_gate else 4 * lp
+        if self.low_rank_out_gate:
+            g_a = fused_in[..., tail + nlh + hd : tail + nlh + 2 * hd]
+            out_gate = self.g_b_proj(g_a.contiguous())
+        else:
+            out_gate = fused_in[..., 3 * lp : 4 * lp]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
-        beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
+        beta = fused_in[..., tail : tail + nlh].unsqueeze(0)
         # f_a feeds a second GEMM (f_b_proj) and is a column slice of the fused
         # output, so it needs a unit row stride rather than the fused N_fused one.
         # Under a per-token FP8 f_b_proj that copy would be followed by a quant
@@ -1229,7 +1347,7 @@ class KimiKDAAttention(nn.Module):
         # quant in one kernel, so only the quantized result is ever written.
         # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
         # not) exactly as before.
-        f_a_view = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd]
+        f_a_view = fused_in[..., tail + nlh : tail + nlh + hd]
         if self.fuse_f_a_quant:
             from atom.model_ops.kimi_k3 import strided_per_token_quant
 
@@ -1279,14 +1397,45 @@ class KimiKDAAttention(nn.Module):
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            # Fused masked gather: ssm_state[state_indices] with fresh
-            # sequences (~has_initial_state) written as zeros in one pass,
-            # replacing the gather + separate zero-write.
             from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
-            initial = gather_kda_initial_state(
-                ssm_state, state_indices_in, kda_metadata.has_initial_state
-            )
+            use_leapquant = getattr(kda_metadata, "leapquant", False)
+            has_initial_state = kda_metadata.has_initial_state
+            # A slot restored from an image stored between decode steps is its
+            # checkpoint plus the records since the last flush; everywhere
+            # else there are none to replay.
+            resume_records = getattr(kda_metadata, "replayssm_resume_records", None)
+            if use_leapquant:
+                initial = leapquant_load_state(
+                    ssm_state,
+                    cache.leapquant_scale,
+                    cache.leapquant_comp,
+                    state_indices_in,
+                )
+            elif resume_records is None:
+                # Fused masked gather: ssm_state[state_indices] with fresh
+                # sequences (~has_initial_state) written as zeros in one pass,
+                # replacing the gather + separate zero-write.
+                initial = gather_kda_initial_state(
+                    ssm_state, state_indices_in, has_initial_state
+                )
+            else:
+                initial = gather_kda_initial_state(ssm_state, state_indices_in)
+            if use_leapquant or resume_records is not None:
+                if resume_records is not None:
+                    replayssm_replay_records(
+                        initial,
+                        cache.replay_buf_k,
+                        cache.replay_buf_u,
+                        cache.replay_buf_g,
+                        state_indices_in,
+                        resume_records,
+                        v_first=not use_leapquant,
+                    )
+                # Zeroed after the replay: a fresh sequence's slot can still
+                # hold the previous tenant's cursor and records.
+                if has_initial_state is not None:
+                    initial.masked_fill_(~has_initial_state.view(-1, 1, 1, 1), 0)
             kda_out, last_state = self._run_kda(
                 q,
                 k,
@@ -1296,11 +1445,21 @@ class KimiKDAAttention(nn.Module):
                 initial,
                 query_start_loc,
                 True,
+                state_v_first=not use_leapquant,
             )
-            # last_state already has ssm_state's dtype (fla preserves the
-            # initial_state dtype; the gathered initial is allocated as such),
-            # so no .to() cast is needed.
-            ssm_state[state_indices] = last_state
+            if use_leapquant:
+                leapquant_store_state(
+                    last_state,
+                    ssm_state,
+                    cache.leapquant_scale,
+                    cache.leapquant_comp,
+                    state_indices,
+                )
+            else:
+                # aiter's chunk KDA returns the state in fp32 whatever
+                # initial_state's dtype, so a bf16 pool (ATOM_GDN_SSM_DTYPE)
+                # needs the cast; for an fp32 pool it is a no-op.
+                ssm_state[state_indices] = last_state.to(ssm_state.dtype)
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
             assert kda_out.dtype == fused_in.dtype, (
@@ -1335,7 +1494,34 @@ class KimiKDAAttention(nn.Module):
             # one kernel. is_kda + lower_bound select the per-K-channel,
             # lower-bounded sigmoid gate that Kimi-KDA uses (beta stays raw
             # logits; the kernel applies sigmoid in fp32 internally).
-            if getattr(kda_metadata, "replayssm", False):
+            if getattr(kda_metadata, "leapquant", False):
+                # ReplaySSM with the int8 checkpoint; this step's folds ran in
+                # the metadata builder for every layer at once.
+                nd = kda_metadata.num_decodes
+                leapquant_sigmoid_gating_delta_rule(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    beta,
+                    self.A_log,
+                    self.dt_bias,
+                    z=ssm_state,
+                    sc=cache.leapquant_scale,
+                    comp=cache.leapquant_comp,
+                    buf_k=cache.replay_buf_k,
+                    buf_u=cache.replay_buf_u,
+                    buf_g=cache.replay_buf_g,
+                    write_pos=kda_metadata.write_pos,
+                    slot_idx=kda_metadata.slot_idx[:nd],
+                    cu_seqlens=query_start_loc[: nd + 1],
+                    max_query_len=kda_metadata.replayssm_max_query_len,
+                    o=out,
+                    use_qk_l2norm_in_kernel=True,
+                    lower_bound=self._kda_gate_lower_bound,
+                    fold=False,
+                )
+            elif getattr(kda_metadata, "replayssm", False):
                 # ReplaySSM: one checkpoint per request; the per-token state
                 # snapshots this pool used to hold are rebuilt from the
                 # (k, u, g) records on demand.
@@ -1795,12 +1981,26 @@ class KimiLinearModel(nn.Module):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return FusedMoE.make_expert_params_mapping(
+        num_routed = self.config.num_experts
+        num_experts = num_routed + (self.config.num_shared_experts or 0)
+        mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.config.num_experts + (self.config.num_shared_experts or 0),
+            num_experts=num_experts,
         )
+        # A fused shared expert keeps its MLP names: the loader moves
+        # `shared_experts.gate_proj` to `experts.{num_routed}.gate_proj`.
+        return mapping + [
+            entry
+            for entry in FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+            )
+            if entry[2] >= num_routed
+        ]
 
 
 class KimiLinearForCausalLM(nn.Module):
@@ -1816,7 +2016,7 @@ class KimiLinearForCausalLM(nn.Module):
         self.config = config
         self.quant_config = atom_config.quant_config
         self.packed_modules_mapping = _kda_packed_modules_mapping(
-            config.kimi_kda_layers
+            config.kimi_kda_layers, q_lora=config.q_lora_rank is not None
         )
         self.model = KimiLinearModel(atom_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:

@@ -2354,9 +2354,10 @@ class Config:
                 self.plugin_config.vllm_config.quant_config, "ignored_layers", []
             )
             self.quant_config.exclude_layers = list(vllm_ignored)
+        # A NoPE model (Kimi-Linear) states its context as `model_max_length`.
         hf_config_max_position_embeddings = getattr(
-            self.hf_config, "max_position_embeddings", 8192
-        )
+            self.hf_config, "max_position_embeddings", None
+        ) or getattr(self.hf_config, "model_max_length", 8192)
         if self.max_model_len is None:
             self.max_model_len = hf_config_max_position_embeddings
         else:

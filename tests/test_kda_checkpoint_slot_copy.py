@@ -63,6 +63,10 @@ def builder(num_slots: int = 4, allocate: bool = True):
         num_state_layers=lambda: N_LAYERS,
         _state_shape_for_runner=lambda: (SHAPE_K, SHAPE_V),
         _state_dtypes=lambda: (DT_K, DT_V),
+        # Neither adds planes here: not LeapQuant's scales and compensators,
+        # nor the ReplaySSM records a single-token image carries.
+        leapquant=False,
+        replayssm=False,
     )
     # The methods under test call each other through `self`. Bind the real
     # ones, so what runs is the shipped code and only the model/runner reads
@@ -72,6 +76,9 @@ def builder(num_slots: int = 4, allocate: bool = True):
         "_checkpoint_num_slots",
         "_checkpoint_layer_ranges",
         "_checkpoint_segment_sizes",
+        "_pool_state_dtypes",
+        "_leapquant_buffer_shapes",
+        "_checkpoint_carries_records",
     ):
         setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
     return stub
@@ -238,6 +245,8 @@ def hybrid_with_kpool_tail(num_slots: int = 4):
     )
     stub = object.__new__(K3._KimiMLAGDNCommon)
     stub.model_runner = runner
+    stub.leapquant = False
+    stub.replayssm = False
     stub._state_shape_for_runner = lambda: (SHAPE_K, SHAPE_V)
     stub._state_dtypes = lambda: (DT_K, DT_V)
     stub._index_cache_layout = lambda: ((3, 7), (3, 7))
@@ -328,6 +337,8 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             _state_shape_for_runner=lambda: (SHAPE_K, SHAPE_V),
             _state_dtypes=lambda: (DT_K, DT_V),
             _page_unit_region_cache=None,
+            leapquant=False,
+            replayssm=False,
         )
         for name in (
             "_checkpoint_plane_shapes",
@@ -336,6 +347,9 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             "_checkpoint_segment_sizes",
             "_checkpoint_slot_bases",
             "checkpoint_image_bytes",
+            "_pool_state_dtypes",
+            "_leapquant_buffer_shapes",
+            "_checkpoint_carries_records",
         ):
             setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
         for name in (
@@ -588,6 +602,8 @@ class TestAnImageSpansBothPoolsIntact:
         stub.num_state_layers = lambda: N_LAYERS
         stub._state_shape_for_runner = lambda: (SHAPE_K, SHAPE_V)
         stub._state_dtypes = lambda: (DT_K, DT_V)
+        stub.leapquant = False
+        stub.replayssm = False
         for name in (
             "_checkpoint_plane_shapes",
             "_checkpoint_num_slots",
@@ -595,6 +611,9 @@ class TestAnImageSpansBothPoolsIntact:
             "_checkpoint_segment_sizes",
             "_checkpoint_slot_bases",
             "checkpoint_image_bytes",
+            "_pool_state_dtypes",
+            "_leapquant_buffer_shapes",
+            "_checkpoint_carries_records",
         ):
             setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
         return stub, k, v, pool, index_cache, plan_segmented_copy

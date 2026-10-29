@@ -19,6 +19,9 @@ from atom.model_ops.fla_ops.leapquant import leapquant_buffer_shapes, leapquant_
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
+    replayssm_flush,
+    replayssm_flushes_ahead,
+    replayssm_records_in_state,
 )
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import AttentionMetaData, Context
@@ -147,6 +150,11 @@ class GDNAttentionMetadata:
     replayssm_cache_len: int = 0
     replayssm_route: str = "auto"
     replayssm_max_query_len: int = 1
+    # Prefill only: how many records of each row's READ slot belong to the
+    # state it resumes, counted before this step parked the cursors. Nonzero
+    # only for a checkpoint published between decode steps; None when no row
+    # resumes anything.
+    replayssm_resume_records: torch.Tensor | None = None
     # LeapQuant: `ssm_state` is the int8 residual, the layer cache carries its
     # scales and compensators, and the step's flushes already ran (all layers
     # at once, in `_attach_replayssm`).
@@ -225,11 +233,6 @@ class GDNStateMixin(PoolRowsMixin):
         self.leapquant = envs.ATOM_ENABLE_LEAPQUANT
         self.leapquant_rank = envs.ATOM_LEAPQUANT_RANK
         if self.leapquant:
-            if self._is_kda():
-                raise NotImplementedError(
-                    "ATOM_ENABLE_LEAPQUANT covers the GDN recurrence; KDA's "
-                    "per-channel gates are not supported."
-                )
             if self.use_spec_decode:
                 raise NotImplementedError(
                     "ATOM_ENABLE_LEAPQUANT decodes one token per step; it does "
@@ -425,12 +428,12 @@ class GDNStateMixin(PoolRowsMixin):
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
         # The KDA recurrence accumulates in fp32 whatever the pool stores, so
-        # the KDA models pick their storage dtype; everyone else keeps the
-        # state at the model dtype.
-        if getattr(self.model_runner.config.hf_config, "model_type", None) in (
-            "kimi_linear",
-            "glm5_next_text",
-        ):
+        # the KDA models pick their storage dtype; everyone else honors the
+        # checkpoint's `mamba_ssm_dtype` (Qwen3.5 declares float32) and keeps
+        # the state at the model dtype when the config does not say.
+        hf = self.model_runner.config.hf_config
+        model_dtype = self.model_runner.config.torch_dtype
+        if getattr(hf, "model_type", None) in ("kimi_linear", "glm5_next_text"):
             requested = envs.ATOM_GDN_SSM_DTYPE
             temporal_dtype = _GDN_SSM_DTYPES.get(requested)
             if temporal_dtype is None:
@@ -438,11 +441,14 @@ class GDNStateMixin(PoolRowsMixin):
                     f"ATOM_GDN_SSM_DTYPE={requested!r} is not one of "
                     f"{sorted(_GDN_SSM_DTYPES)}."
                 )
-            return (self.model_runner.config.torch_dtype, temporal_dtype)
-        return (
-            self.model_runner.config.torch_dtype,
-            self.model_runner.config.torch_dtype,
-        )
+            return (model_dtype, temporal_dtype)
+        requested = getattr(hf, "mamba_ssm_dtype", None)
+        if requested is None:
+            return (model_dtype, model_dtype)
+        types = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+        if requested not in types:
+            raise ValueError(f"unsupported mamba_ssm_dtype: {requested}")
+        return (model_dtype, types[requested])
 
     def _pool_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
         """What the pool stores: `_state_dtypes`, unless LeapQuant replaces the
@@ -562,11 +568,12 @@ class GDNStateMixin(PoolRowsMixin):
         not before.
 
         Exact, not approximate, when it is turned back on: `h` is `k.new_empty`
-        and `_state_dtypes` returns `config.torch_dtype`, so slicing `h` rounds
-        exactly where a shortened forward would. That rests on the two dtypes
-        agreeing; kimi_linear's temporal side is `ATOM_GDN_SSM_DTYPE` and need
-        not, so it overrides unconditionally
-        (`_KimiMLAGDNCommon.state_transfer`).
+        and, absent `mamba_ssm_dtype`, `_state_dtypes` returns
+        `config.torch_dtype`, so slicing `h` rounds exactly where a shortened
+        forward would. That rests on the two dtypes agreeing; a checkpoint that
+        declares an fp32 state (Qwen3.5) breaks it, and kimi_linear's temporal
+        side is `ATOM_GDN_SSM_DTYPE` and need not agree either, so it overrides
+        unconditionally (`_KimiMLAGDNCommon.state_transfer`).
         """
         return StateTransfer.fork(1, readable_midstep=False)
 
@@ -609,7 +616,9 @@ class GDNStateMixin(PoolRowsMixin):
             STATE_SLOT_CLASS,
             self.num_state_layers() * per_layer
             + self._replayssm_bytes_per_slot()
-            + self._leapquant_bytes_per_slot(),
+            + self._leapquant_bytes_per_slot()
+            # The cursor, when an image carries it: a slot has to hold its image.
+            + (4 if self._checkpoint_carries_records() else 0),
             entries_per_req=self.slots_per_req(),
         )
 
@@ -746,7 +755,9 @@ class GDNStateMixin(PoolRowsMixin):
         ]
 
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
-        """`(per_layer_bytes, num_layers)` per plane, conv first then ssm.
+        """`(per_layer_bytes, num_layers)` per plane, conv first then ssm, then
+        LeapQuant's scales and compensators, then the ReplaySSM records and
+        cursor when an image carries them (`_checkpoint_carries_records`).
 
         Pure geometry from the state shapes, so it answers before the tensors
         exist -- which `checkpoint_image_bytes` needs, being called during
@@ -755,10 +766,25 @@ class GDNStateMixin(PoolRowsMixin):
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._pool_state_dtypes()
         n = self.num_state_layers()
-        return [
+        shapes = [
             (math.prod(shape_k) * dt_k.itemsize, n),
             (math.prod(shape_v) * dt_v.itemsize, n),
         ]
+        side = self._leapquant_buffer_shapes()
+        if side is not None:
+            s_scale, s_comp = side
+            shapes += [(math.prod(s_scale) * 4, n), (math.prod(s_comp) * 2, n)]
+        if self._checkpoint_carries_records():
+            sk, su, sg = self._replayssm_buffer_shapes()
+            rec = self._record_dtype().itemsize
+            shapes += [
+                (math.prod(sk) * rec, n),
+                (math.prod(su) * rec, n),
+                (math.prod(sg) * 4, n),
+                # The cursor: one int32 per slot, shared by every layer.
+                (4, 1),
+            ]
+        return shapes
 
     def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
         """Allocated source planes in the order `_checkpoint_plane_shapes` names.
@@ -767,10 +793,29 @@ class GDNStateMixin(PoolRowsMixin):
         runs before these tensors exist. Hybrid backends may extend both lists
         with state that shares the same slot lifetime.
         """
-        return [
-            self.model_runner.mamba_k_cache,
-            self.model_runner.mamba_v_cache,
-        ]
+        runner = self.model_runner
+        planes = [runner.mamba_k_cache, runner.mamba_v_cache]
+        if self._leapquant_buffer_shapes() is not None:
+            planes += [runner.leapquant_scale, runner.leapquant_comp]
+        if self._checkpoint_carries_records():
+            planes += [
+                runner.replayssm_buf_k,
+                runner.replayssm_buf_u,
+                runner.replayssm_buf_g,
+                runner.replayssm_write_pos.view(1, -1),
+            ]
+        return planes
+
+    def _checkpoint_carries_records(self) -> bool:
+        """Whether an image holds the ReplaySSM records and cursor.
+
+        A slot stored between single-token decode steps is its checkpoint plus
+        the records since the last flush, and the prefill that restores it
+        replays them (`replayssm_resume_records`); the checkpoint alone is the
+        state up to a window earlier. Speculative decode resumes no records,
+        so its images keep their size.
+        """
+        return self.replayssm and self.replayssm_max_query_len == 1
 
     def _checkpoint_num_slots(self) -> int:
         """The slot axis of the state tensors, or 1 before they exist.
@@ -1396,11 +1441,15 @@ class GDNStateMixin(PoolRowsMixin):
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
         if self.replayssm:
-            self._attach_replayssm(gdn_attn_metadata, num_reqs, is_prefill)
+            self._attach_replayssm(gdn_attn_metadata, num_reqs, is_prefill, batch)
         return gdn_attn_metadata
 
     def _attach_replayssm(
-        self, md: GDNAttentionMetadata, num_reqs: int, is_prefill: bool
+        self,
+        md: GDNAttentionMetadata,
+        num_reqs: int,
+        is_prefill: bool,
+        batch: ScheduledBatch,
     ) -> None:
         """Fill the ReplaySSM fields and move the record cursor exactly once.
 
@@ -1408,6 +1457,11 @@ class GDNStateMixin(PoolRowsMixin):
         every linear-attention layer in the step must see the same `write_pos`,
         so it happens here (metadata prep, outside any captured graph) rather
         than inside the layer kernel.
+
+        A state fork is also settled here, because the ReplaySSM kernels have
+        no read-side index: they rebuild from, and append to, one slot. The
+        slot a fork reads holds a checkpoint plus the records its cursor
+        covers, and both halves of that have to be accounted for.
         """
         slot_idx = self.non_spec_state_indices_tensor.gpu[:num_reqs]
         write_pos = self.model_runner.replayssm_write_pos
@@ -1420,6 +1474,23 @@ class GDNStateMixin(PoolRowsMixin):
         md.leapquant = self.leapquant
 
         if is_prefill:
+            # The prefill reads its incoming state through the read-side
+            # index, so a fork needs no copy; but a source published between
+            # decode steps still carries records, and parking the cursor
+            # below would forget them when the source is also the write slot
+            # (an adopted checkpoint). Count them first. Only single-token
+            # decode publishes such a source, and no row resumes anything
+            # unless one has cached tokens.
+            in_idx = md.non_spec_state_indices_in_tensor
+            cached = getattr(batch, "num_cached_tokens", None) or ()
+            if (
+                in_idx is not None
+                and self.replayssm_max_query_len == 1
+                and any(int(c) > 0 for c in cached)
+            ):
+                md.replayssm_resume_records = replayssm_records_in_state(
+                    write_pos, in_idx[:num_reqs], self.replayssm_cache_len
+                )
             # A prefill (re)initialises the checkpoint wholesale via
             # `chunk_gated_delta_rule` and writes NO records, so the next
             # forward must fold none.  Parking the cursor at -1 rather than 0
@@ -1437,6 +1508,22 @@ class GDNStateMixin(PoolRowsMixin):
             write_pos.index_fill_(0, live, -1)
             return
 
+        # Decode after a checkpoint was published mid-generation: the request
+        # moved to a fresh slot and its state -- checkpoint, records and
+        # cursor -- is still in the one it left. Carry all of it over before
+        # the commit below advances the cursor; the source stays as it is,
+        # filed under its hash. Only plain decode forks (the spec path
+        # asserts it never does).
+        if not self.use_spec_decode:
+            fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
+            forks = [
+                (src, slots[0])
+                for slots, src in zip(batch.state_slots, fork_srcs)
+                if src >= 0
+            ]
+            if forks:
+                self.relocate_state_slots(forks)
+
         # Decode: apply the PREVIOUS step's accepted counts.  For non-spec
         # decode `num_accepted_tokens` stays at its initialised value of 1,
         # which is exactly one committed token per step.
@@ -1447,11 +1534,12 @@ class GDNStateMixin(PoolRowsMixin):
             self.replayssm_max_query_len,
             self.replayssm_cache_len,
         )
+        # This step's flushes, for every layer in one launch: the cursor
+        # decides them and is shared by all layers. Runs outside the captured
+        # graph, so those layer kernels only ever decode. The other ReplaySSM
+        # kernels (KDA, verify windows) fold in place.
+        runner = self.model_runner
         if self.leapquant:
-            # This step's flushes, for every layer in one launch: the cursor
-            # decides them and is shared by all layers. Runs outside the
-            # captured graph, so the layer kernels only ever decode.
-            runner = self.model_runner
             leapquant_fold(
                 runner.mamba_v_cache,
                 runner.leapquant_scale,
@@ -1461,6 +1549,18 @@ class GDNStateMixin(PoolRowsMixin):
                 runner.replayssm_buf_g,
                 write_pos,
                 slot_idx,
+            )
+        elif not self._is_kda() and replayssm_flushes_ahead(
+            self.replayssm_max_query_len
+        ):
+            replayssm_flush(
+                runner.mamba_v_cache,
+                runner.replayssm_buf_k,
+                runner.replayssm_buf_u,
+                runner.replayssm_buf_g,
+                write_pos,
+                slot_idx,
+                self.replayssm_max_query_len,
             )
 
     def _attach_gdn_decode_metadata(
@@ -1679,6 +1779,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
                 gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
             )
+            if self.replayssm:
+                # A copied-out checkpoint is a whole state with no records,
+                # but its slot's cursor is whatever the previous tenant left,
+                # and a resume counts records by it.
+                self.model_runner.replayssm_write_pos.index_fill_(
+                    0, gdn_metadata.ssm_checkpoints["slots"].long(), -1
+                )
 
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions

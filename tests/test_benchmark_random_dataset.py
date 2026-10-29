@@ -145,6 +145,15 @@ def test_range_ratio_bounds_the_sampled_lengths():
     assert all(4 <= output_len <= 8 for _, _, output_len, _ in requests)
 
 
+def test_ids_stay_below_the_model_vocab():
+    """A tokenizer can count ids past the embedding; a server fed one faults."""
+    requests = _sample(FakeTokenizer(), model_vocab_size=990, prefix_len=16,
+                       num_prompts=200)
+
+    assert max(int(t) for r in requests for t in r[0].split()) < 990
+    assert all(prompt_len == 16 + 64 for _, prompt_len, _, _ in requests)
+
+
 def test_prefix_is_shared_by_every_prompt():
     requests = _sample(FakeTokenizer(), prefix_len=16, num_prompts=8)
 

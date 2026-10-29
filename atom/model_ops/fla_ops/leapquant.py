@@ -36,6 +36,14 @@ compensators decay with the checkpoint, so a window's state is
 exactly as in ReplaySSM.  A flush materialises ``S_h`` once in fp32, refits
 the compensators (warm-started from the previous window's), recomputes the
 smoothing and re-quantises.
+
+KDA's gate is a ``[K]`` vector per token, so ``e^{C_h}`` is ``diag(e^{C_h})``
+on the key side.  That still leaves the stored form alone:
+
+    diag(e^C) S_0 = diag(e^C * c) Z diag(b) + (Kc diag(e^C))^T Uc
+
+only the smoothing ``c`` and the compensator keys pick the decay up, and the
+residual ``Z`` is untouched -- the same int8 slot serves both recurrences.
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from .op import exp
-from .replayssm import flush_threshold_ok
+from .replayssm import _kda_gate, flush_threshold_ok
 
 __all__ = [
     "COLD_ITERS",
@@ -55,7 +63,9 @@ __all__ = [
     "leapquant_fold",
     "leapquant_gated_delta_rule",
     "leapquant_load_state",
+    "leapquant_sigmoid_gating_delta_rule",
     "leapquant_store_state",
+    "leapquant_write_checkpoints",
 ]
 
 #: Power-iteration steps per compensator.  A prefill has nothing to start
@@ -64,6 +74,7 @@ __all__ = [
 #: across windows (see `_lq_quantize`).
 COLD_ITERS = 8
 WARM_ITERS = 0
+_COLD_ITERS = tl.constexpr(COLD_ITERS)
 
 #: Lower bound on the smoothing factors, so an all-zero key row still divides.
 SMOOTH_FLOOR = tl.constexpr(1e-6)
@@ -126,6 +137,15 @@ def _lq_boundary(
 
 
 @triton.jit
+def _lq_load_gate(p_g, mask_k, m, IS_KDA: tl.constexpr):
+    """One record's log-decay: ``[K]`` for KDA (``p_g`` spans the channels),
+    a scalar for GDN."""
+    if IS_KDA:
+        return tl.load(p_g, mask=mask_k & m, other=0.0).to(tl.float32)
+    return tl.load(p_g, mask=m, other=0.0).to(tl.float32)
+
+
+@triton.jit
 def _lq_rebuild(
     buf_k,
     buf_u,
@@ -153,18 +173,33 @@ def _lq_rebuild(
     V: tl.constexpr,
     BH: tl.constexpr,
     R: tl.constexpr,
+    IS_KDA: tl.constexpr,
 ):
     """The window's state ``S_h`` in fp32.
 
     Every term is added as a rank-1 update with its vectors loaded straight
-    from memory, so the tile stays in the layout the fit reduces over.
+    from memory, so the tile stays in the layout the fit reduces over.  Under
+    KDA every decay is a ``[K]`` vector; the expressions are the same.
     """
     o_h = tl.arange(0, BH)
     p_g = buf_g + slot * stride_bufg_slot + i_hv * stride_bufg_hv
-    b_ctot = tl.sum(
-        tl.load(p_g + o_h * stride_bufg_pos, mask=o_h < h, other=0.0).to(tl.float32),
-        axis=0,
-    )
+    if IS_KDA:
+        b_ctot = tl.sum(
+            tl.load(
+                p_g + o_h[None, :] * stride_bufg_pos + o_k[:, None],
+                mask=mask_k[:, None] & (o_h < h)[None, :],
+                other=0.0,
+            ).to(tl.float32),
+            axis=1,
+        )
+        p_g = p_g + o_k
+    else:
+        b_ctot = tl.sum(
+            tl.load(p_g + o_h * stride_bufg_pos, mask=o_h < h, other=0.0).to(
+                tl.float32
+            ),
+            axis=0,
+        )
     b_decay = exp(b_ctot)
 
     b_z = tl.load(
@@ -185,15 +220,13 @@ def _lq_rebuild(
     b_cj = b_ctot * 0.0
     # One record of prefetch: the next record's loads are in flight while
     # this one is accumulated.
-    b_gn = tl.load(p_g, mask=h > 0, other=0.0).to(tl.float32)
+    b_gn = _lq_load_gate(p_g, mask_k, h > 0, IS_KDA)
     b_kn = tl.load(p_k, mask=mask_k & (h > 0), other=0.0)
     b_un = tl.load(p_u, mask=mask_v & (h > 0), other=0.0)
     for j in range(0, h):
         b_gj, b_kj, b_uj = b_gn, b_kn, b_un
         m_n = j + 1 < h
-        b_gn = tl.load(p_g + (j + 1) * stride_bufg_pos, mask=m_n, other=0.0).to(
-            tl.float32
-        )
+        b_gn = _lq_load_gate(p_g + (j + 1) * stride_bufg_pos, mask_k, m_n, IS_KDA)
         b_kn = tl.load(p_k + (j + 1) * stride_bufk_pos, mask=mask_k & m_n, other=0.0)
         b_un = tl.load(p_u + (j + 1) * stride_bufu_pos, mask=mask_v & m_n, other=0.0)
         b_cj += b_gj
@@ -239,16 +272,21 @@ def _lq_quantize(
     is one power-iteration step chained across windows (``u_old = S_old^T
     k_old``), so tracking the top subspace costs one reduction per window
     beyond the projection.  ``ITERS`` adds full steps on top.  The old row is
-    read before this component overwrites it.
+    read before this component overwrites it.  Where ``S u_old`` vanishes (its
+    fp16 value underflowed, say) the component starts over as a cold one.
     """
     for r in tl.static_range(R):
         if WARM:
             b_uo = tl.load(p_comp + r * (K + V) + K + o_v, mask=mask_v, other=0.0)
-            b_ko = tl.load(p_comp + r * (K + V) + o_k, mask=mask_k, other=0.0)
             b_kv = tl.sum(b_s * b_uo.to(tl.float32)[None, :], 1)
-            b_ko = b_ko.to(tl.float32)
-            b_ko = tl.where(tl.max(tl.abs(b_ko), 0) > _TINY, b_ko, 1.0)
-            b_kv = tl.where(tl.max(tl.abs(b_kv), 0) > _TINY, b_kv, b_ko)
+            # The restart has to come out of the tile as `b_kv` does. Mixing
+            # in a separately loaded [K] vector (the old key) made the result
+            # vary from run to run with 2 warps on ROCm, barriers or not.
+            if tl.max(tl.abs(b_kv), 0) <= _TINY:
+                b_kv = _lq_unit(tl.sqrt(tl.sum(b_s * b_s, 1)))
+                for _ in tl.static_range(_COLD_ITERS):
+                    b_uv = tl.sum(b_s * b_kv[:, None], 0)
+                    b_kv = _lq_unit(tl.sum(b_s * b_uv[None, :], 1))
         else:
             # The row norms point at the outlier rows the tokens are for.
             b_kv = tl.sqrt(tl.sum(b_s * b_s, 1))
@@ -322,6 +360,7 @@ def _leapquant_fold_kernel(
     FROM_STATE: tl.constexpr,
     ITERS: tl.constexpr,
     WARM: tl.constexpr,
+    IS_KDA: tl.constexpr,
 ):
     """One program per (sequence, v-head, layer), holding the whole ``[K, V]``
     tile.
@@ -389,6 +428,7 @@ def _leapquant_fold_kernel(
             V,
             BH,
             R,
+            IS_KDA,
         )
 
     _lq_quantize(
@@ -456,6 +496,8 @@ def _leapquant_decode_kernel(
     v,
     g,
     beta,
+    A_log,
+    dt_bias,
     o,
     z,
     sc,
@@ -467,6 +509,7 @@ def _leapquant_decode_kernel(
     slot_idx,
     cu_seqlens,
     scale,
+    LOWER_BOUND,
     N,
     CAP,
     H: tl.constexpr,
@@ -492,7 +535,15 @@ def _leapquant_decode_kernel(
     stride_bufg_hv: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_BETA_HEADWISE: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
+    """One token of one sequence and v-head.
+
+    ``IS_KDA`` is Kimi's recurrence: ``g`` is the raw ``[K]`` gate input that
+    `_kda_gate` turns into a per-channel log-decay, and ``beta`` holds logits.
+    Otherwise ``g`` is GDN's scalar log-decay and ``beta`` the write strength.
+    """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -528,20 +579,40 @@ def _leapquant_decode_kernel(
         b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
         b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q = b_q * scale
-    b_gt = tl.load(g + bos * HV + i_hv).to(tl.float32)
+    if IS_KDA:
+        b_gt = _kda_gate(
+            A_log + i_hv,
+            g + (bos * HV + i_hv) * K + o_k,
+            dt_bias + i_hv * K + o_k,
+            mask_k,
+            LOWER_BOUND,
+            USE_LOWER_BOUND,
+        )
+    else:
+        b_gt = tl.load(g + bos * HV + i_hv).to(tl.float32)
     # (e^g S_h)^T x == S_h^T (e^g x): this step's gate rides on the vectors.
     b_eg = exp(b_gt)
     b_xk = b_eg * b_k
     b_xq = b_eg * b_q
 
     # ---- the window's records ------------------------------------------------
-    b_g1 = tl.load(
-        buf_g + slot * stride_bufg_slot + o_h * stride_bufg_pos + i_hv * stride_bufg_hv,
-        mask=m_h,
-        other=0.0,
-    ).to(tl.float32)
-    b_ctot = tl.sum(b_g1, axis=0)
-    b_w = exp(b_ctot - tl.cumsum(b_g1, axis=0))
+    p_g = buf_g + slot * stride_bufg_slot + i_hv * stride_bufg_hv
+    if IS_KDA:
+        # [BK, BH]: every channel decays at its own rate, so the weights are
+        # a tile rather than one per record.
+        b_g1 = tl.load(
+            p_g + o_h[None, :] * stride_bufg_pos + o_k[:, None],
+            mask=m_h[None, :] & mask_k[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        b_ctot = tl.sum(b_g1, axis=1)
+        b_w = exp(b_ctot[:, None] - tl.cumsum(b_g1, axis=1))
+    else:
+        b_g1 = tl.load(p_g + o_h * stride_bufg_pos, mask=m_h, other=0.0).to(
+            tl.float32
+        )
+        b_ctot = tl.sum(b_g1, axis=0)
+        b_w = exp(b_ctot - tl.cumsum(b_g1, axis=0))
     b_decay = exp(b_ctot)
     b_kr = tl.load(
         buf_k
@@ -561,8 +632,13 @@ def _leapquant_decode_kernel(
         mask=m_h[:, None] & mask_v[None, :],
         other=0.0,
     ).to(tl.float32)
-    b_rk = b_w * tl.sum(b_kr * b_xk[:, None], 0)
-    b_rq = b_w * tl.sum(b_kr * b_xq[:, None], 0)
+    if IS_KDA:
+        b_kr = b_kr * b_w
+        b_rk = tl.sum(b_kr * b_xk[:, None], 0)
+        b_rq = tl.sum(b_kr * b_xq[:, None], 0)
+    else:
+        b_rk = b_w * tl.sum(b_kr * b_xk[:, None], 0)
+        b_rq = b_w * tl.sum(b_kr * b_xq[:, None], 0)
     b_sk = tl.sum(b_rk[:, None] * b_ur, 0)
     b_sq = tl.sum(b_rq[:, None] * b_ur, 0)
 
@@ -586,14 +662,23 @@ def _leapquant_decode_kernel(
     b_cu = tl.load(
         p_row + K + o_v[None, :], mask=mask_c[:, None] & mask_v[None, :], other=0.0
     ).to(tl.float32)
-    b_sk += tl.sum((b_decay * tl.sum(b_ck * b_xk[None, :], 1))[:, None] * b_cu, 0)
-    b_sq += tl.sum((b_decay * tl.sum(b_ck * b_xq[None, :], 1))[:, None] * b_cu, 0)
+    if IS_KDA:
+        # The decay is on the key side, so it scales the contraction vector.
+        b_rk = tl.sum(b_ck * (b_decay * b_xk)[None, :], 1)
+        b_rq = tl.sum(b_ck * (b_decay * b_xq)[None, :], 1)
+        b_sk += tl.sum(b_rk[:, None] * b_cu, 0)
+        b_sq += tl.sum(b_rq[:, None] * b_cu, 0)
+    else:
+        b_sk += tl.sum((b_decay * tl.sum(b_ck * b_xk[None, :], 1))[:, None] * b_cu, 0)
+        b_sq += tl.sum((b_decay * tl.sum(b_ck * b_xq[None, :], 1))[:, None] * b_cu, 0)
 
     # ---- this token ------------------------------------------------------------
     b_v = tl.load(v + (bos * HV + i_hv) * V + o_v, mask=mask_v, other=0.0).to(
         tl.float32
     )
-    if IS_BETA_HEADWISE:
+    if IS_KDA:
+        b_beta = tl.sigmoid(tl.load(beta + bos * HV + i_hv).to(tl.float32))
+    elif IS_BETA_HEADWISE:
         b_beta = tl.load(
             beta + (bos * HV + i_hv) * V + o_v, mask=mask_v, other=0.0
         ).to(tl.float32)
@@ -623,8 +708,11 @@ def _leapquant_decode_kernel(
             + o_k
         )
         tl.store(p_bk, b_k.to(p_bk.dtype.element_ty), mask=mask_k)
-        p_bg = buf_g + slot * stride_bufg_slot + base * stride_bufg_pos
-        tl.store(p_bg + i_hv * stride_bufg_hv, b_gt.to(p_bg.dtype.element_ty))
+        p_bg = p_g + base * stride_bufg_pos
+        if IS_KDA:
+            tl.store(p_bg + o_k, b_gt.to(p_bg.dtype.element_ty), mask=mask_k)
+        else:
+            tl.store(p_bg, b_gt.to(p_bg.dtype.element_ty))
 
 
 _MAX_INT_32 = 2**31 - 1
@@ -734,6 +822,7 @@ def leapquant_fold(
     slot_idx: torch.Tensor,
     iters: int = WARM_ITERS,
     num_warps: int = 2,
+    waves_per_eu: int = 2,
 ) -> None:
     """Fold full record buffers into the boundary states, before a decode step.
 
@@ -743,14 +832,17 @@ def leapquant_fold(
     sequence flushes in every layer at the same step and one launch covers
     them all.  A fold is a few dozen microseconds of dependent reductions, so
     batching the layers is what turns that latency into throughput.
+
+    KDA's ``buf_g`` has a channel axis, as ``buf_k`` does; GDN's has none.
     """
+    is_kda = buf_g.ndim == buf_k.ndim
     tensors = (
         _layered(z, 4),
         _layered(sc, 3),
         _layered(comp, 4),
         _layered(buf_k, 4),
         _layered(buf_u, 4),
-        _layered(buf_g, 3),
+        _layered(buf_g, 4 if is_kda else 3),
     )
     _check_side_layout(*tensors[:3])
     L, _, HV, K, V = tensors[0].shape
@@ -785,7 +877,12 @@ def leapquant_fold(
             FROM_STATE=False,
             ITERS=iters,
             WARM=True,
+            IS_KDA=is_kda,
             num_warps=num_warps,
+            # The fp32 tile takes ~296 VGPRs at num_warps=2, one wave per
+            # SIMD, and the fold is latency-bound there. Capping at 256 gives
+            # two waves for ~25 spilled registers: the same bytes, ~25% faster.
+            waves_per_eu=waves_per_eu,
         )
 
 
@@ -833,6 +930,7 @@ def leapquant_store_state(
         FROM_STATE=True,
         ITERS=iters,
         WARM=False,
+        IS_KDA=False,
         num_warps=4,
     )
 
@@ -845,8 +943,9 @@ def leapquant_load_state(
 ) -> torch.Tensor:
     """Dequantise the boundary states of ``slot_idx`` into fp32 ``[N, HV, K, V]``.
 
-    Records are not replayed: callers use this where the cursor is parked at
-    the prefill sentinel, i.e. the boundary is the whole state.  Entries of
+    The boundary only.  It is the whole state where the cursor sits at the
+    prefill sentinel; a slot published between decode steps also holds
+    records, which `replayssm_replay_records` folds in.  Entries of
     ``slot_idx`` below 0 come back as zeros.
     """
     _check_side_layout(z, sc, comp)
@@ -873,6 +972,138 @@ def leapquant_load_state(
         num_warps=8,
     )
     return out
+
+
+def leapquant_write_checkpoints(
+    h: torch.Tensor,
+    final_state: torch.Tensor,
+    z: torch.Tensor,
+    sc: torch.Tensor,
+    comp: torch.Tensor,
+    rows: torch.Tensor,
+    slots: torch.Tensor,
+    offs: torch.Tensor,
+    is_end: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+    chunk_size: int,
+) -> None:
+    """The SSM half of `write_state_checkpoints`, for the int8 pool.
+
+    Same targets: an interior one is the chunk boundary
+    ``h[chunk_offsets[row] + off // chunk_size]``, one at the end of its row's
+    tokens is that row's ``final_state`` (``[N, HV, K, V]`` fp32), which ``h``
+    does not hold.  Each is quantised into its slot as a prefill's final state
+    is, so the slot's cursor has to be parked at the prefill sentinel.
+    """
+    n = rows.numel()
+    if n == 0:
+        return
+    HV, K, V = z.shape[-3:]
+    rows = rows.long()
+    h = h.reshape(-1, HV, K, V)
+    src = chunk_offsets.long()[rows] + offs.long() // chunk_size
+    inner = h.index_select(0, src.clamp(max=h.shape[0] - 1)).float()
+    state = torch.where(
+        is_end.bool()[:, None, None, None], final_state.index_select(0, rows), inner
+    )
+    leapquant_store_state(state, z, sc, comp, slots)
+
+
+def _leapquant_decode(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    z,
+    sc,
+    comp,
+    buf_k,
+    buf_u,
+    buf_g,
+    write_pos,
+    slot_idx,
+    cu_seqlens,
+    max_query_len,
+    o,
+    scale,
+    use_qk_l2norm_in_kernel,
+    fold,
+    iters,
+    block_v,
+    num_warps,
+    kda=None,
+) -> torch.Tensor:
+    """Launch the decode kernel; ``kda`` is ``(A_log, dt_bias, lower_bound)``
+    for Kimi's in-kernel gating, None for GDN's precomputed ``g``/``beta``."""
+    if max_query_len != 1:
+        raise NotImplementedError(
+            "LeapQuant decode handles one token per sequence; speculative "
+            "verify windows are not supported yet"
+        )
+    assert q.shape[0] == 1, "varlen layout expected (B == 1)"
+    _check_side_layout(z, sc, comp)
+    _, T_tot, H, K = q.shape
+    HV, V = v.shape[2], v.shape[3]
+    N = cu_seqlens.numel() - 1
+    cap = buf_k.shape[2]
+    rank = comp.shape[2]
+    if scale is None:
+        scale = K**-0.5
+    assert flush_threshold_ok(cap, 1), f"record buffer of {cap} is too short"
+    assert beta.ndim != v.ndim, "LeapQuant decode expects a per-head beta"
+
+    q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
+    o = q.new_empty(1, T_tot, HV, V) if o is None else o.view(1, T_tot, HV, V)
+    if N == 0:
+        return o
+    if fold:
+        leapquant_fold(
+            z, sc, comp, buf_k, buf_u, buf_g, write_pos, slot_idx[:N], iters=iters
+        )
+    A_log, dt_bias, lower_bound = (g, g, None) if kda is None else kda
+    BV = min(triton.next_power_of_2(V), block_v)
+    _leapquant_decode_kernel[(triton.cdiv(V, BV), N * HV)](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        o=o,
+        z=_span(z),
+        sc=_span(sc),
+        comp=_span(comp),
+        buf_k=_span(buf_k),
+        buf_u=_span(buf_u),
+        buf_g=_span(buf_g),
+        write_pos=write_pos,
+        slot_idx=slot_idx,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
+        N=N,
+        CAP=cap,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=triton.next_power_of_2(K),
+        BV=BV,
+        BH=_record_block(cap),
+        BR=_rank_block(rank),
+        R=rank,
+        **_side_strides(z, sc, comp),
+        **_record_strides(buf_k, buf_u, buf_g),
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_BETA_HEADWISE=False,
+        IS_KDA=kda is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return o
 
 
 def leapquant_gated_delta_rule(
@@ -905,65 +1136,50 @@ def leapquant_gated_delta_rule(
     ``fold=False`` when the caller already ran :func:`leapquant_fold` for this
     step over every layer at once.
     """
-    if max_query_len != 1:
-        raise NotImplementedError(
-            "LeapQuant decode handles one token per sequence; speculative "
-            "verify windows are not supported yet"
-        )
-    assert q.shape[0] == 1, "varlen layout expected (B == 1)"
-    _check_side_layout(z, sc, comp)
-    _, T_tot, H, K = q.shape
-    HV, V = v.shape[2], v.shape[3]
-    N = cu_seqlens.numel() - 1
-    cap = buf_k.shape[2]
-    rank = comp.shape[2]
-    if scale is None:
-        scale = K**-0.5
-    assert flush_threshold_ok(cap, 1), f"record buffer of {cap} is too short"
-    assert beta.ndim != v.ndim, "LeapQuant decode expects a per-head beta"
+    return _leapquant_decode(
+        q, k, v, g, beta, z, sc, comp, buf_k, buf_u, buf_g, write_pos, slot_idx,
+        cu_seqlens, max_query_len, None, scale, use_qk_l2norm_in_kernel, fold,
+        iters, block_v, num_warps,
+    )  # fmt: skip
 
-    q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
-    o = q.new_empty(1, T_tot, HV, V)
-    if N == 0:
-        return o
-    if fold:
-        leapquant_fold(
-            z, sc, comp, buf_k, buf_u, buf_g, write_pos, slot_idx[:N], iters=iters
-        )
-    BV = min(triton.next_power_of_2(V), block_v)
-    _leapquant_decode_kernel[(triton.cdiv(V, BV), N * HV)](
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        o=o,
-        z=_span(z),
-        sc=_span(sc),
-        comp=_span(comp),
-        buf_k=_span(buf_k),
-        buf_u=_span(buf_u),
-        buf_g=_span(buf_g),
-        write_pos=write_pos,
-        slot_idx=slot_idx,
-        cu_seqlens=cu_seqlens,
-        scale=scale,
-        N=N,
-        CAP=cap,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=triton.next_power_of_2(K),
-        BV=BV,
-        BH=_record_block(cap),
-        BR=_rank_block(rank),
-        R=rank,
-        **_side_strides(z, sc, comp),
-        **_record_strides(buf_k, buf_u, buf_g),
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        IS_BETA_HEADWISE=False,
-        num_warps=num_warps,
-        num_stages=1,
-    )
-    return o
+
+def leapquant_sigmoid_gating_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    z: torch.Tensor,
+    sc: torch.Tensor,
+    comp: torch.Tensor,
+    buf_k: torch.Tensor,
+    buf_u: torch.Tensor,
+    buf_g: torch.Tensor,
+    write_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_query_len: int,
+    o: torch.Tensor | None = None,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    lower_bound: float | None = None,
+    fold: bool = True,
+    iters: int = WARM_ITERS,
+    block_v: int = 128,
+    num_warps: int = 1,
+) -> torch.Tensor:
+    """LeapQuant decode for one KDA layer; same contract as
+    :func:`replayssm_sigmoid_gating_delta_rule` (raw gate input ``a``, beta
+    logits ``b``) with the checkpoint pool replaced by ``(z, sc, comp)``.
+
+    ``z`` is addressed ``[K, V]`` per head like GDN's, not V-first like the
+    fp32 KDA pool: only LeapQuant reads it, and a prefill hands it a K-first
+    state (``chunk_kimi_delta_attn(state_v_first=False)``).
+    """
+    return _leapquant_decode(
+        q, k, v, a, b, z, sc, comp, buf_k, buf_u, buf_g, write_pos, slot_idx,
+        cu_seqlens, max_query_len, o, scale, use_qk_l2norm_in_kernel, fold,
+        iters, block_v, num_warps, kda=(A_log, dt_bias, lower_bound),
+    )  # fmt: skip
